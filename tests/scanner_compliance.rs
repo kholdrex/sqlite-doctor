@@ -58,7 +58,11 @@ PRAGMA foreign_keys = FaLsE;
 PRAGMA foreign_keys=NO;
 PRAGMA foreign_keys;
 PRAGMA foreign_keys();
+PRAGMA foreign_keys(ON);
 PRAGMA foreign_keys(OFF);
+PRAGMA main.foreign_keys(0);
+pragma "aux" . FOREIGN_KEYS(FaLsE);
+PRAGMA foreign_keys(NO);
 COMMIT;
 "#;
     let report = scan_sql(sql);
@@ -67,7 +71,7 @@ COMMIT;
         .iter()
         .map(|finding| finding.line)
         .collect();
-    assert_eq!(lines, vec![3, 4, 5, 6]);
+    assert_eq!(lines, vec![3, 4, 5, 6, 10, 11, 12, 13]);
 }
 
 #[test]

@@ -465,16 +465,22 @@ fn is_foreign_keys_off(statement: &Statement) -> bool {
     let Some((name, index)) = parse_name(tokens, 1) else {
         return false;
     };
-    name.leaf() == "foreign_keys"
-        && name.parts.len() <= 2
-        && symbol_is(tokens, index, '=')
-        && tokens.get(index + 1).is_some_and(|token| {
-            keyword(token, "OFF")
-                || keyword(token, "FALSE")
-                || keyword(token, "NO")
-                || matches!(&token.kind, TokenKind::Word(value) if value == "0")
-        })
-        && tokens.len() == index + 2
+    if name.leaf() != "foreign_keys" || name.parts.len() > 2 {
+        return false;
+    }
+    let has_equals_assignment = symbol_is(tokens, index, '=') && tokens.len() == index + 2;
+    let has_parenthesized_assignment = symbol_is(tokens, index, '(')
+        && symbol_is(tokens, index + 2, ')')
+        && tokens.len() == index + 3;
+    if !has_equals_assignment && !has_parenthesized_assignment {
+        return false;
+    }
+    tokens.get(index + 1).is_some_and(|token| {
+        keyword(token, "OFF")
+            || keyword(token, "FALSE")
+            || keyword(token, "NO")
+            || matches!(&token.kind, TokenKind::Word(value) if value == "0")
+    })
 }
 
 fn created_rebuild_table(statement: &Statement) -> Option<Name> {
