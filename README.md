@@ -77,5 +77,5 @@ dropped or having its foreign key removed before a later parent rebuild.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
-cargo run
+cargo run -- --help
 ```
