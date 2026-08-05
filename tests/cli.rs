@@ -64,6 +64,16 @@ fn invalid_arguments_are_usage_errors() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("human or json"));
 }
 
+#[test]
+fn missing_input_is_a_usage_error() {
+    let output = Command::new(env!("CARGO_BIN_EXE_sqlite-doctor"))
+        .output()
+        .expect("CLI should run");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("provide a SQL file"));
+}
+
 fn run_cli(extra_arguments: &[&str], sql: &str) -> Output {
     let path = temporary_sql_path();
     fs::write(&path, sql).expect("temporary SQL fixture should be written");

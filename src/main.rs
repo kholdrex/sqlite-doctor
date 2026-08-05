@@ -23,8 +23,7 @@ fn main() -> ExitCode {
 
 fn run(arguments: Vec<String>) -> Result<u8, String> {
     if arguments.is_empty() {
-        print_help();
-        return Ok(0);
+        return Err("provide a SQL file or `-` for stdin".to_string());
     }
 
     let mut format = OutputFormat::Human;
