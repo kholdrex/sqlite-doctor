@@ -1,0 +1,18 @@
+[package]
+name = "sqlite-doctor"
+version = "0.1.0"
+edition = "2024"
+description = "SQLite migration safety linter for ORM-generated rebuild hazards"
+license = "MIT"
+repository = "https://github.com/kholdrex/sqlite-doctor"
+publish = false
+
+[lib]
+name = "sqlite_doctor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sqlite-doctor"
+path = "src/main.rs"
+
+[dependencies]
