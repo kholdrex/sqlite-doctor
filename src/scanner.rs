@@ -8,9 +8,11 @@
 //! sequence is unsafe.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PragmaInTransaction {
+pub struct ForeignKeysPragmaInTransaction {
     /// One-based source line containing the PRAGMA statement.
     pub line: usize,
+    /// The ignored state requested by the statement.
+    pub requested_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,12 +24,28 @@ pub struct RebuildSequence {
     pub copy_line: usize,
     pub drop_line: usize,
     pub rename_line: usize,
+    /// Effective lexical `PRAGMA foreign_keys` state at the drop. `None`
+    /// means the input did not establish a state the scanner can observe.
+    pub foreign_keys_enabled_at_drop: Option<bool>,
+    pub(crate) drop_statement_index: usize,
+    pub(crate) original_table_parts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CascadeReference {
+    pub dependent_table: String,
+    pub referenced_table: String,
+    /// One-based source line containing the cascading reference.
+    pub line: usize,
+    pub(crate) statement_index: usize,
+    pub(crate) referenced_table_parts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanReport {
-    pub foreign_keys_off_in_transactions: Vec<PragmaInTransaction>,
+    pub foreign_keys_pragmas_in_transactions: Vec<ForeignKeysPragmaInTransaction>,
     pub rebuilds: Vec<RebuildSequence>,
+    pub cascade_references: Vec<CascadeReference>,
 }
 
 /// Scans one SQLite SQL input for transaction-scoped foreign-key pragmas and
@@ -39,20 +57,33 @@ pub fn scan_sql(sql: &str) -> ScanReport {
     let statements = statements(sql);
     let mut report = ScanReport::default();
     let mut transaction = TransactionState::default();
+    let mut foreign_keys_enabled = None;
+    let mut foreign_key_states = Vec::with_capacity(statements.len());
 
-    for statement in &statements {
-        if transaction.in_transaction && is_foreign_keys_off(statement) {
-            report
-                .foreign_keys_off_in_transactions
-                .push(PragmaInTransaction {
-                    line: statement.line,
-                });
+    for (statement_index, statement) in statements.iter().enumerate() {
+        report
+            .cascade_references
+            .extend(cascade_references(statement, statement_index));
+        if let Some(enabled) = foreign_keys_setting(statement) {
+            if transaction.in_transaction {
+                report
+                    .foreign_keys_pragmas_in_transactions
+                    .push(ForeignKeysPragmaInTransaction {
+                        line: statement.line,
+                        requested_enabled: enabled,
+                    });
+            } else {
+                foreign_keys_enabled = Some(enabled);
+            }
         }
+        foreign_key_states.push(foreign_keys_enabled);
         transaction.apply(statement);
     }
 
     let mut candidates = Vec::<RebuildCandidate>::new();
-    for statement in &statements {
+    for (statement_index, (statement, foreign_keys_enabled)) in
+        statements.iter().zip(foreign_key_states).enumerate()
+    {
         if let Some(temporary_table) = created_rebuild_table(statement) {
             // A replacement table with the same identity supersedes an older,
             // incomplete candidate. Later steps must not finish the old create.
@@ -82,6 +113,8 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                         .is_some_and(|name| name.matches(&original_table))
             }) {
                 candidate.drop_line = statement.line;
+                candidate.drop_statement_index = statement_index;
+                candidate.foreign_keys_enabled_at_drop = foreign_keys_enabled;
                 candidate.stage = CandidateStage::Dropped;
             }
             continue;
@@ -108,6 +141,9 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 copy_line: candidate.copy_line,
                 drop_line: candidate.drop_line,
                 rename_line: statement.line,
+                foreign_keys_enabled_at_drop: candidate.foreign_keys_enabled_at_drop,
+                drop_statement_index: candidate.drop_statement_index,
+                original_table_parts: original.parts,
             });
         }
     }
@@ -457,33 +493,53 @@ impl TransactionState {
     }
 }
 
-fn is_foreign_keys_off(statement: &Statement) -> bool {
+fn foreign_keys_setting(statement: &Statement) -> Option<bool> {
     let tokens = &statement.tokens;
     if !token_is(tokens, 0, "PRAGMA") {
-        return false;
+        return None;
     }
-    let Some((name, index)) = parse_name(tokens, 1) else {
-        return false;
-    };
+    let (name, index) = parse_name(tokens, 1)?;
     if name.leaf() != "foreign_keys" || name.parts.len() > 2 {
-        return false;
+        return None;
     }
     let has_equals_assignment = symbol_is(tokens, index, '=') && tokens.len() == index + 2;
     let has_parenthesized_assignment = symbol_is(tokens, index, '(')
         && symbol_is(tokens, index + 2, ')')
         && tokens.len() == index + 3;
     if !has_equals_assignment && !has_parenthesized_assignment {
-        return false;
+        return None;
     }
-    tokens.get(index + 1).is_some_and(|token| {
-        keyword(token, "OFF")
-            || keyword(token, "FALSE")
-            || keyword(token, "NO")
-            || matches!(&token.kind, TokenKind::Word(value) if value == "0")
-    })
+    let value = tokens.get(index + 1)?;
+    if keyword(value, "OFF")
+        || keyword(value, "FALSE")
+        || keyword(value, "NO")
+        || numeric_pragma_value(value) == Some(false)
+    {
+        Some(false)
+    } else if keyword(value, "ON")
+        || keyword(value, "TRUE")
+        || keyword(value, "YES")
+        || numeric_pragma_value(value) == Some(true)
+    {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn numeric_pragma_value(token: &Token) -> Option<bool> {
+    match &token.kind {
+        TokenKind::Word(word) => word.parse::<i64>().ok().map(|value| value != 0),
+        _ => None,
+    }
 }
 
 fn created_rebuild_table(statement: &Statement) -> Option<Name> {
+    let (table, _) = created_table(statement)?;
+    table.leaf().starts_with("__new_").then_some(table)
+}
+
+fn created_table(statement: &Statement) -> Option<(Name, usize)> {
     let tokens = &statement.tokens;
     if !token_is(tokens, 0, "CREATE") {
         return None;
@@ -502,8 +558,71 @@ fn created_rebuild_table(statement: &Statement) -> Option<Name> {
     {
         index += 3;
     }
-    let (table, _) = parse_name(tokens, index)?;
-    table.leaf().starts_with("__new_").then_some(table)
+    parse_name(tokens, index)
+}
+
+fn cascade_references(statement: &Statement, statement_index: usize) -> Vec<CascadeReference> {
+    let tokens = &statement.tokens;
+    let Some((dependent_table, opening_parenthesis)) = created_table(statement) else {
+        return Vec::new();
+    };
+    if !symbol_is(tokens, opening_parenthesis, '(') {
+        return Vec::new();
+    }
+
+    table_definition_ranges(tokens, opening_parenthesis)
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let reference_index =
+                (start..end).find(|index| token_is(tokens, *index, "REFERENCES"))?;
+            let (referenced_table, mut index) = parse_name(tokens, reference_index + 1)?;
+            if symbol_is(tokens, index, '(') {
+                index = after_balanced_parentheses(tokens, index)?;
+            }
+            let cascades = (index..end).any(|index| {
+                token_is(tokens, index, "ON")
+                    && token_is(tokens, index + 1, "DELETE")
+                    && token_is(tokens, index + 2, "CASCADE")
+            });
+            (cascades && !dependent_table.matches(&referenced_table)).then(|| CascadeReference {
+                dependent_table: dependent_table.canonical(),
+                referenced_table: referenced_table.canonical(),
+                line: tokens[reference_index].line,
+                statement_index,
+                referenced_table_parts: referenced_table.parts,
+            })
+        })
+        .collect()
+}
+
+fn table_definition_ranges(tokens: &[Token], opening_parenthesis: usize) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut depth = 1usize;
+    let mut start = opening_parenthesis + 1;
+
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        match token.kind {
+            TokenKind::Symbol('(') => depth += 1,
+            TokenKind::Symbol(')') => {
+                depth -= 1;
+                if depth == 0 {
+                    if start < index {
+                        ranges.push((start, index));
+                    }
+                    break;
+                }
+            }
+            TokenKind::Symbol(',') if depth == 1 => {
+                if start < index {
+                    ranges.push((start, index));
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+
+    ranges
 }
 
 fn copied_table(statement: &Statement) -> Option<(Name, Name)> {
@@ -592,6 +711,8 @@ struct RebuildCandidate {
     create_line: usize,
     copy_line: usize,
     drop_line: usize,
+    drop_statement_index: usize,
+    foreign_keys_enabled_at_drop: Option<bool>,
     stage: CandidateStage,
 }
 
@@ -603,6 +724,8 @@ impl RebuildCandidate {
             create_line,
             copy_line: 0,
             drop_line: 0,
+            drop_statement_index: 0,
+            foreign_keys_enabled_at_drop: None,
             stage: CandidateStage::Created,
         }
     }
@@ -623,8 +746,8 @@ mod tests {
         "#;
 
         let report = scan_sql(sql);
-        assert_eq!(report.foreign_keys_off_in_transactions.len(), 1);
-        assert_eq!(report.foreign_keys_off_in_transactions[0].line, 4);
+        assert_eq!(report.foreign_keys_pragmas_in_transactions.len(), 1);
+        assert_eq!(report.foreign_keys_pragmas_in_transactions[0].line, 4);
     }
 
     #[test]

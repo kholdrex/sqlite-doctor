@@ -8,8 +8,8 @@ const SAFE_FRAGMENTS: &str = include_str!("fixtures/safe_fragments.sql");
 fn rails_fixture_detects_transaction_pragma_and_rebuild() {
     let report = scan_sql(RAILS_REBUILD);
 
-    assert_eq!(report.foreign_keys_off_in_transactions.len(), 1);
-    assert_eq!(report.foreign_keys_off_in_transactions[0].line, 3);
+    assert_eq!(report.foreign_keys_pragmas_in_transactions.len(), 1);
+    assert_eq!(report.foreign_keys_pragmas_in_transactions[0].line, 3);
     assert_eq!(report.rebuilds.len(), 1);
 
     let rebuild = &report.rebuilds[0];
@@ -25,7 +25,7 @@ fn rails_fixture_detects_transaction_pragma_and_rebuild() {
 fn drizzle_fixture_detects_rebuild_but_not_out_of_scope_pragma() {
     let report = scan_sql(DRIZZLE_REBUILD);
 
-    assert!(report.foreign_keys_off_in_transactions.is_empty());
+    assert!(report.foreign_keys_pragmas_in_transactions.is_empty());
     assert_eq!(report.rebuilds.len(), 1);
     assert_eq!(report.rebuilds[0].temporary_table, "__new_users");
     assert_eq!(report.rebuilds[0].original_table, "users");
@@ -35,6 +35,6 @@ fn drizzle_fixture_detects_rebuild_but_not_out_of_scope_pragma() {
 fn incomplete_sequences_and_sql_inside_literals_are_ignored() {
     let report = scan_sql(SAFE_FRAGMENTS);
 
-    assert!(report.foreign_keys_off_in_transactions.is_empty());
+    assert!(report.foreign_keys_pragmas_in_transactions.is_empty());
     assert!(report.rebuilds.is_empty());
 }

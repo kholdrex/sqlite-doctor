@@ -16,8 +16,8 @@ END;
 PRAGMA foreign_keys = OFF;
 "#;
     let report = scan_sql(sql);
-    assert_eq!(report.foreign_keys_off_in_transactions.len(), 1);
-    assert_eq!(report.foreign_keys_off_in_transactions[0].line, 10);
+    assert_eq!(report.foreign_keys_pragmas_in_transactions.len(), 1);
+    assert_eq!(report.foreign_keys_pragmas_in_transactions[0].line, 10);
     assert!(report.rebuilds.is_empty());
 }
 
@@ -41,7 +41,7 @@ PRAGMA foreign_keys=OFF;
 "#;
     let report = scan_sql(sql);
     let lines: Vec<_> = report
-        .foreign_keys_off_in_transactions
+        .foreign_keys_pragmas_in_transactions
         .iter()
         .map(|finding| finding.line)
         .collect();
@@ -49,7 +49,7 @@ PRAGMA foreign_keys=OFF;
 }
 
 #[test]
-fn pragma_assignment_accepts_schema_and_false_spellings_but_not_queries() {
+fn pragma_assignment_accepts_schema_and_boolean_spellings_but_not_queries() {
     let sql = r#"
 BEGIN;
 PRAGMA main.foreign_keys = off;
@@ -67,11 +67,11 @@ COMMIT;
 "#;
     let report = scan_sql(sql);
     let lines: Vec<_> = report
-        .foreign_keys_off_in_transactions
+        .foreign_keys_pragmas_in_transactions
         .iter()
         .map(|finding| finding.line)
         .collect();
-    assert_eq!(lines, vec![3, 4, 5, 6, 10, 11, 12, 13]);
+    assert_eq!(lines, vec![3, 4, 5, 6, 9, 10, 11, 12, 13]);
 }
 
 #[test]
@@ -84,8 +84,8 @@ fn lexer_ignores_decoys_and_handles_quoting_crlf_and_eof() {
         "/* CREATE TABLE __new_bad(x); */ PRAGMA foreign_keys = 0"
     );
     let report = scan_sql(sql);
-    assert_eq!(report.foreign_keys_off_in_transactions.len(), 1);
-    assert_eq!(report.foreign_keys_off_in_transactions[0].line, 5);
+    assert_eq!(report.foreign_keys_pragmas_in_transactions.len(), 1);
+    assert_eq!(report.foreign_keys_pragmas_in_transactions[0].line, 5);
     assert!(report.rebuilds.is_empty());
 }
 
