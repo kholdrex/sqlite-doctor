@@ -28,7 +28,46 @@ pub struct RebuildSequence {
     /// means the input did not establish a state the scanner can observe.
     pub foreign_keys_enabled_at_drop: Option<bool>,
     pub(crate) drop_statement_index: usize,
+    pub(crate) rename_statement_index: usize,
+    pub(crate) temporary_table_parts: Vec<String>,
     pub(crate) original_table_parts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaObjectKind {
+    Index,
+    Trigger,
+}
+
+impl SchemaObjectKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Index => "index",
+            Self::Trigger => "trigger",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaObject {
+    pub kind: SchemaObjectKind,
+    pub name: String,
+    pub table: String,
+    /// One-based source line containing the CREATE statement.
+    pub line: usize,
+    pub(crate) statement_index: usize,
+    pub(crate) name_parts: Vec<String>,
+    pub(crate) table_parts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedSchemaObject {
+    pub kind: SchemaObjectKind,
+    pub name: String,
+    /// One-based source line containing the DROP statement.
+    pub line: usize,
+    pub(crate) statement_index: usize,
+    pub(crate) name_parts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,10 +85,13 @@ pub struct ScanReport {
     pub foreign_keys_pragmas_in_transactions: Vec<ForeignKeysPragmaInTransaction>,
     pub rebuilds: Vec<RebuildSequence>,
     pub cascade_references: Vec<CascadeReference>,
+    pub schema_objects: Vec<SchemaObject>,
+    pub dropped_schema_objects: Vec<DroppedSchemaObject>,
 }
 
-/// Scans one SQLite SQL input for transaction-scoped foreign-key pragmas and
-/// structural create/copy/drop/rename table-rebuild patterns.
+/// Scans one SQLite SQL input for transaction-scoped foreign-key pragmas,
+/// structural create/copy/drop/rename table-rebuild patterns, and explicit
+/// index/trigger lifecycle evidence.
 ///
 /// The result reflects only lexical SQL present in `sql`; a rebuild match is a
 /// pattern anchor, not proof that the sequence is unsafe at runtime.
@@ -61,6 +103,12 @@ pub fn scan_sql(sql: &str) -> ScanReport {
     let mut foreign_key_states = Vec::with_capacity(statements.len());
 
     for (statement_index, statement) in statements.iter().enumerate() {
+        if let Some(schema_object) = created_schema_object(statement, statement_index) {
+            report.schema_objects.push(schema_object);
+        }
+        if let Some(schema_object) = dropped_schema_object(statement, statement_index) {
+            report.dropped_schema_objects.push(schema_object);
+        }
         report
             .cascade_references
             .extend(cascade_references(statement, statement_index));
@@ -143,6 +191,8 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 rename_line: statement.line,
                 foreign_keys_enabled_at_drop: candidate.foreign_keys_enabled_at_drop,
                 drop_statement_index: candidate.drop_statement_index,
+                rename_statement_index: statement_index,
+                temporary_table_parts: candidate.temporary_table.parts,
                 original_table_parts: original.parts,
             });
         }
@@ -559,6 +609,120 @@ fn created_table(statement: &Statement) -> Option<(Name, usize)> {
         index += 3;
     }
     parse_name(tokens, index)
+}
+
+fn created_schema_object(statement: &Statement, statement_index: usize) -> Option<SchemaObject> {
+    created_index(statement, statement_index)
+        .or_else(|| created_trigger(statement, statement_index))
+}
+
+fn created_index(statement: &Statement, statement_index: usize) -> Option<SchemaObject> {
+    let tokens = &statement.tokens;
+    if !token_is(tokens, 0, "CREATE") {
+        return None;
+    }
+    let mut index = 1;
+    if token_is(tokens, index, "UNIQUE") {
+        index += 1;
+    }
+    if !token_is(tokens, index, "INDEX") {
+        return None;
+    }
+    index += 1;
+    if token_is(tokens, index, "IF")
+        && token_is(tokens, index + 1, "NOT")
+        && token_is(tokens, index + 2, "EXISTS")
+    {
+        index += 3;
+    }
+    let (name, index) = parse_name(tokens, index)?;
+    if !token_is(tokens, index, "ON") {
+        return None;
+    }
+    let (table, _) = parse_name(tokens, index + 1)?;
+    Some(SchemaObject {
+        kind: SchemaObjectKind::Index,
+        name: name.canonical(),
+        table: table.canonical(),
+        line: statement.line,
+        statement_index,
+        name_parts: name.parts,
+        table_parts: table.parts,
+    })
+}
+
+fn created_trigger(statement: &Statement, statement_index: usize) -> Option<SchemaObject> {
+    let tokens = &statement.tokens;
+    if !token_is(tokens, 0, "CREATE") {
+        return None;
+    }
+    let mut index = 1;
+    if token_is(tokens, index, "TEMP") || token_is(tokens, index, "TEMPORARY") {
+        index += 1;
+    }
+    if !token_is(tokens, index, "TRIGGER") {
+        return None;
+    }
+    index += 1;
+    if token_is(tokens, index, "IF")
+        && token_is(tokens, index + 1, "NOT")
+        && token_is(tokens, index + 2, "EXISTS")
+    {
+        index += 3;
+    }
+    let (name, index) = parse_name(tokens, index)?;
+    let (table, _) = (index..tokens.len()).find_map(|position| {
+        if !token_is(tokens, position, "ON") {
+            return None;
+        }
+        let (table, end) = parse_name(tokens, position + 1)?;
+        let follows_attachment = end == tokens.len()
+            || token_is(tokens, end, "FOR")
+            || token_is(tokens, end, "WHEN")
+            || token_is(tokens, end, "BEGIN");
+        follows_attachment.then_some((table, end))
+    })?;
+    Some(SchemaObject {
+        kind: SchemaObjectKind::Trigger,
+        name: name.canonical(),
+        table: table.canonical(),
+        line: statement.line,
+        statement_index,
+        name_parts: name.parts,
+        table_parts: table.parts,
+    })
+}
+
+fn dropped_schema_object(
+    statement: &Statement,
+    statement_index: usize,
+) -> Option<DroppedSchemaObject> {
+    let tokens = &statement.tokens;
+    if !token_is(tokens, 0, "DROP") {
+        return None;
+    }
+    let kind = if token_is(tokens, 1, "INDEX") {
+        SchemaObjectKind::Index
+    } else if token_is(tokens, 1, "TRIGGER") {
+        SchemaObjectKind::Trigger
+    } else {
+        return None;
+    };
+    let mut index = 2;
+    if token_is(tokens, index, "IF") && token_is(tokens, index + 1, "EXISTS") {
+        index += 2;
+    }
+    let (name, end) = parse_name(tokens, index)?;
+    if end != tokens.len() {
+        return None;
+    }
+    Some(DroppedSchemaObject {
+        kind,
+        name: name.canonical(),
+        line: statement.line,
+        statement_index,
+        name_parts: name.parts,
+    })
 }
 
 fn cascade_references(statement: &Statement, statement_index: usize) -> Vec<CascadeReference> {
