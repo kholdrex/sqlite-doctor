@@ -44,6 +44,29 @@ fn json_output_has_a_stable_machine_readable_shape() {
 }
 
 #[test]
+fn schema_object_omission_is_reported_in_human_and_json_output() {
+    let sql = r#"
+CREATE INDEX idx_users_email ON users(email);
+CREATE TABLE __new_users(id INTEGER, email TEXT);
+INSERT INTO __new_users SELECT id, email FROM users;
+DROP TABLE users;
+ALTER TABLE __new_users RENAME TO users;
+"#;
+
+    let human = run_cli(&[], sql);
+    assert_eq!(human.status.code(), Some(1));
+    let stdout = String::from_utf8(human.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("SQLD003"));
+    assert!(stdout.contains("idx_users_email"));
+
+    let json = run_cli(&["--format", "json"], sql);
+    assert_eq!(json.status.code(), Some(1));
+    let stdout = String::from_utf8(json.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("\"code\": \"SQLD003\""));
+    assert!(stdout.contains("\"related_line\": 2"));
+}
+
+#[test]
 fn safe_input_succeeds_and_reports_no_findings() {
     let output = run_cli(&[], "CREATE TABLE widgets(id INTEGER PRIMARY KEY);\n");
     assert!(output.status.success());
