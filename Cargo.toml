@@ -16,3 +16,4 @@ name = "sqlite-doctor"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = "1"

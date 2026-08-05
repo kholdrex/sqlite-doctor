@@ -18,4 +18,4 @@ jobs:
       - name: cargo test
         run: cargo test --all-features
       - name: cargo run
-        run: cargo run
+        run: cargo run -- --help

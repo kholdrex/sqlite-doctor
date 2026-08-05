@@ -34,6 +34,28 @@ The first MVP focuses on static detection of high-signal hazards:
 
 Private scout-created repository. Not published.
 
+## CLI usage
+
+Scan a SQL file with human-readable diagnostics:
+
+```bash
+cargo run -- migration.sql
+```
+
+Use `-` to read SQL from standard input, or select stable JSON output for CI:
+
+```bash
+cat migration.sql | cargo run -- --format json -
+```
+
+The CLI exits with `0` when the input is clean, `1` when it finds a supported
+hazard, and `2` for invalid arguments or unreadable input. `SQLD001` reports a
+complete table rebuild when the same input also defines an existing dependent
+table with an explicit `ON DELETE CASCADE` reference. A safe
+`PRAGMA foreign_keys=OFF` before the transaction suppresses that finding;
+placing the pragma inside the transaction emits `SQLD002` because SQLite
+ignores the attempted state change.
+
 ## Scanner scope and limitations
 
 The scanner is a dependency-free lexical scanner for one SQLite SQL input, not
@@ -45,7 +67,9 @@ or non-SQLite dialect input is outside its scope.
 
 A reported rebuild is a structural create/copy/drop/rename pattern anchor. It
 is useful evidence for later diagnostics, not proof by itself that the sequence
-is unsafe.
+is unsafe. Cascade-reference evidence is derived from `CREATE TABLE` statements
+in the same input; the scanner does not currently model a dependent table being
+dropped or having its foreign key removed before a later parent rebuild.
 
 ## Local checks
 
@@ -53,5 +77,5 @@ is unsafe.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
-cargo run
+cargo run -- --help
 ```
