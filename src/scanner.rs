@@ -1,3 +1,12 @@
+//! A small, dependency-free lexical scanner for SQLite migration text.
+//!
+//! This is deliberately not a general SQL parser. It splits a single SQLite
+//! input, classifies a narrow statement vocabulary, tracks lexical transaction
+//! state, and anchors structural table-rebuild patterns. It cannot observe
+//! framework-injected transactions, dynamic SQL, runtime-selected pragmas, or
+//! state carried across inputs. A rebuild match is an anchor, not proof that a
+//! sequence is unsafe.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PragmaInTransaction {
     /// One-based source line containing the PRAGMA statement.
@@ -21,89 +30,184 @@ pub struct ScanReport {
     pub rebuilds: Vec<RebuildSequence>,
 }
 
-/// Scans raw SQLite SQL for the two structural signals needed by the first
-/// milestone. This intentionally recognizes a small statement vocabulary
-/// rather than attempting to parse arbitrary SQL.
+/// Scans one SQLite SQL input for transaction-scoped foreign-key pragmas and
+/// structural create/copy/drop/rename table-rebuild patterns.
+///
+/// The result reflects only lexical SQL present in `sql`; a rebuild match is a
+/// pattern anchor, not proof that the sequence is unsafe at runtime.
 pub fn scan_sql(sql: &str) -> ScanReport {
     let statements = statements(sql);
     let mut report = ScanReport::default();
-    let mut transaction_depth = 0usize;
+    let mut transaction = TransactionState::default();
 
     for statement in &statements {
-        if is_transaction_end(statement) {
-            transaction_depth = transaction_depth.saturating_sub(1);
-        } else if is_transaction_start(statement) {
-            transaction_depth += 1;
-        } else if transaction_depth > 0 && is_foreign_keys_off(statement) {
+        if transaction.in_transaction && is_foreign_keys_off(statement) {
             report
                 .foreign_keys_off_in_transactions
                 .push(PragmaInTransaction {
                     line: statement.line,
                 });
         }
+        transaction.apply(statement);
     }
 
-    for (create_index, statement) in statements.iter().enumerate() {
-        let Some(temporary_table) = created_rebuild_table(statement) else {
+    let mut candidates = Vec::<RebuildCandidate>::new();
+    for statement in &statements {
+        if let Some(temporary_table) = created_rebuild_table(statement) {
+            // A replacement table with the same identity supersedes an older,
+            // incomplete candidate. Later steps must not finish the old create.
+            candidates.retain(|candidate| !candidate.temporary_table.matches(&temporary_table));
+            candidates.push(RebuildCandidate::new(temporary_table, statement.line));
             continue;
-        };
+        }
 
-        let Some((copy_index, original_table)) = statements
-            .iter()
-            .enumerate()
-            .skip(create_index + 1)
-            .find_map(|(index, candidate)| {
-                copied_table(candidate, &temporary_table)
-                    .map(|original| (index, original.to_owned()))
+        if let Some((temporary_table, original_table)) = copied_table(statement) {
+            if let Some(candidate) = candidates.iter_mut().rev().find(|candidate| {
+                candidate.stage == CandidateStage::Created
+                    && candidate.temporary_table.matches(&temporary_table)
+            }) {
+                candidate.original_table = Some(original_table);
+                candidate.copy_line = statement.line;
+                candidate.stage = CandidateStage::Copied;
+            }
+            continue;
+        }
+
+        if let Some(original_table) = dropped_table(statement) {
+            if let Some(candidate) = candidates.iter_mut().rev().find(|candidate| {
+                candidate.stage == CandidateStage::Copied
+                    && candidate
+                        .original_table
+                        .as_ref()
+                        .is_some_and(|name| name.matches(&original_table))
+            }) {
+                candidate.drop_line = statement.line;
+                candidate.stage = CandidateStage::Dropped;
+            }
+            continue;
+        }
+
+        if let Some((temporary_table, original_table)) = renamed_table(statement)
+            && let Some(index) = candidates.iter().rposition(|candidate| {
+                candidate.stage == CandidateStage::Dropped
+                    && candidate.temporary_table.matches(&temporary_table)
+                    && candidate
+                        .original_table
+                        .as_ref()
+                        .is_some_and(|name| name.matches(&original_table))
             })
-        else {
-            continue;
-        };
-
-        let Some((drop_index, drop_statement)) = statements
-            .iter()
-            .enumerate()
-            .skip(copy_index + 1)
-            .find(|(_, candidate)| {
-                dropped_table(candidate)
-                    .is_some_and(|name| name.eq_ignore_ascii_case(&original_table))
-            })
-        else {
-            continue;
-        };
-
-        let Some(rename_statement) = statements.iter().skip(drop_index + 1).find(|candidate| {
-            renamed_table(candidate).is_some_and(|(from, to)| {
-                from.eq_ignore_ascii_case(&temporary_table)
-                    && to.eq_ignore_ascii_case(&original_table)
-            })
-        }) else {
-            continue;
-        };
-
-        report.rebuilds.push(RebuildSequence {
-            temporary_table,
-            original_table,
-            create_line: statement.line,
-            copy_line: statements[copy_index].line,
-            drop_line: drop_statement.line,
-            rename_line: rename_statement.line,
-        });
+        {
+            let candidate = candidates.remove(index);
+            let original = candidate
+                .original_table
+                .expect("a dropped candidate has an original table");
+            report.rebuilds.push(RebuildSequence {
+                temporary_table: candidate.temporary_table.canonical(),
+                original_table: original.canonical(),
+                create_line: candidate.create_line,
+                copy_line: candidate.copy_line,
+                drop_line: candidate.drop_line,
+                rename_line: statement.line,
+            });
+        }
     }
 
     report
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TokenKind {
+    Word(String),
+    QuotedIdentifier(String),
+    StringLiteral,
+    Symbol(char),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Token {
+    kind: TokenKind,
+    line: usize,
+}
+
 #[derive(Debug)]
 struct Statement {
-    tokens: Vec<String>,
+    tokens: Vec<Token>,
     line: usize,
 }
 
 fn statements(sql: &str) -> Vec<Statement> {
+    let tokens = lex(sql);
     let mut result = Vec::new();
-    let mut tokens = Vec::new();
-    let mut statement_line = None;
+    let mut current = Vec::new();
+    let mut is_trigger = false;
+    let mut trigger_body = false;
+    let mut trigger_end = false;
+    let mut case_depth = 0usize;
+
+    for token in tokens {
+        if matches!(token.kind, TokenKind::Symbol(';')) {
+            if is_trigger && !(trigger_body && trigger_end) {
+                current.push(token);
+            } else {
+                finish_statement(&mut result, &mut current);
+                is_trigger = false;
+                trigger_body = false;
+                trigger_end = false;
+                case_depth = 0;
+            }
+            continue;
+        }
+
+        current.push(token);
+        if !is_trigger {
+            is_trigger = create_trigger_prefix(&current);
+        }
+        if !is_trigger {
+            continue;
+        }
+
+        let last = current.last().expect("token was just pushed");
+        if !trigger_body {
+            if keyword(last, "BEGIN") {
+                trigger_body = true;
+            }
+        } else if keyword(last, "CASE") {
+            case_depth += 1;
+        } else if keyword(last, "END") {
+            if case_depth == 0 {
+                trigger_end = true;
+            } else {
+                case_depth -= 1;
+            }
+        }
+    }
+
+    finish_statement(&mut result, &mut current);
+    result
+}
+
+fn create_trigger_prefix(tokens: &[Token]) -> bool {
+    if !token_is(tokens, 0, "CREATE") {
+        return false;
+    }
+    let mut index = 1;
+    if token_is(tokens, index, "TEMP") || token_is(tokens, index, "TEMPORARY") {
+        index += 1;
+    }
+    token_is(tokens, index, "TRIGGER")
+}
+
+fn finish_statement(result: &mut Vec<Statement>, tokens: &mut Vec<Token>) {
+    if let Some(first) = tokens.first() {
+        result.push(Statement {
+            line: first.line,
+            tokens: std::mem::take(tokens),
+        });
+    }
+}
+
+fn lex(sql: &str) -> Vec<Token> {
+    let mut result = Vec::new();
     let mut line = 1usize;
     let mut chars = sql.chars().peekable();
 
@@ -133,55 +237,49 @@ fn statements(sql: &str) -> Vec<Statement> {
                     previous = comment_ch;
                 }
             }
-            ';' => finish_statement(&mut result, &mut tokens, &mut statement_line),
             '\'' => {
-                statement_line.get_or_insert(line);
+                let start_line = line;
                 skip_quoted(&mut chars, '\'', &mut line);
-                tokens.push("<string>".to_owned());
+                result.push(Token {
+                    kind: TokenKind::StringLiteral,
+                    line: start_line,
+                });
             }
             '"' | '`' => {
-                statement_line.get_or_insert(line);
-                tokens.push(read_quoted_identifier(&mut chars, ch, &mut line));
+                let start_line = line;
+                let identifier = read_quoted_identifier(&mut chars, ch, &mut line);
+                result.push(Token {
+                    kind: TokenKind::QuotedIdentifier(identifier),
+                    line: start_line,
+                });
             }
             '[' => {
-                statement_line.get_or_insert(line);
-                tokens.push(read_quoted_identifier(&mut chars, ']', &mut line));
+                let start_line = line;
+                let identifier = read_quoted_identifier(&mut chars, ']', &mut line);
+                result.push(Token {
+                    kind: TokenKind::QuotedIdentifier(identifier),
+                    line: start_line,
+                });
             }
-            '=' | '(' | ')' | ',' => {
-                statement_line.get_or_insert(line);
-                tokens.push(ch.to_string());
-            }
-            _ => {
-                statement_line.get_or_insert(line);
-                let mut token = String::from(ch);
-                while chars
-                    .peek()
-                    .is_some_and(|next| is_identifier_character(*next))
-                {
-                    token.push(chars.next().expect("peeked character is present"));
+            ch if is_word_character(ch) => {
+                let start_line = line;
+                let mut word = String::from(ch);
+                while chars.peek().is_some_and(|next| is_word_character(*next)) {
+                    word.push(chars.next().expect("peeked character is present"));
                 }
-                tokens.push(token);
+                result.push(Token {
+                    kind: TokenKind::Word(word),
+                    line: start_line,
+                });
             }
+            _ => result.push(Token {
+                kind: TokenKind::Symbol(ch),
+                line,
+            }),
         }
     }
 
-    finish_statement(&mut result, &mut tokens, &mut statement_line);
     result
-}
-
-fn finish_statement(
-    statements: &mut Vec<Statement>,
-    tokens: &mut Vec<String>,
-    line: &mut Option<usize>,
-) {
-    if !tokens.is_empty() {
-        statements.push(Statement {
-            tokens: std::mem::take(tokens),
-            line: line.take().expect("non-empty statement has a line"),
-        });
-    } else {
-        *line = None;
-    }
 }
 
 fn skip_quoted<I>(chars: &mut std::iter::Peekable<I>, delimiter: char, line: &mut usize)
@@ -229,113 +327,279 @@ where
     identifier
 }
 
-fn is_identifier_character(ch: char) -> bool {
-    ch.is_alphanumeric() || matches!(ch, '_' | '$' | '.')
+fn is_word_character(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '_' | '$')
 }
 
-fn token_is(statement: &Statement, index: usize, expected: &str) -> bool {
-    statement
-        .tokens
+fn keyword(token: &Token, expected: &str) -> bool {
+    matches!(&token.kind, TokenKind::Word(word) if word.eq_ignore_ascii_case(expected))
+}
+
+fn token_is(tokens: &[Token], index: usize, expected: &str) -> bool {
+    tokens
         .get(index)
-        .is_some_and(|token| token.eq_ignore_ascii_case(expected))
+        .is_some_and(|token| keyword(token, expected))
 }
 
-fn is_transaction_start(statement: &Statement) -> bool {
-    token_is(statement, 0, "BEGIN") || token_is(statement, 0, "SAVEPOINT")
+fn symbol_is(tokens: &[Token], index: usize, expected: char) -> bool {
+    tokens
+        .get(index)
+        .is_some_and(|token| token.kind == TokenKind::Symbol(expected))
 }
 
-fn is_transaction_end(statement: &Statement) -> bool {
-    token_is(statement, 0, "COMMIT")
-        || token_is(statement, 0, "END")
-        || token_is(statement, 0, "ROLLBACK")
-        || token_is(statement, 0, "RELEASE")
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Name {
+    parts: Vec<String>,
+}
+
+impl Name {
+    fn leaf(&self) -> &str {
+        self.parts.last().expect("a name has at least one part")
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self == other
+            || ((self.parts.len() == 1 || other.parts.len() == 1) && self.leaf() == other.leaf())
+    }
+
+    fn canonical(&self) -> String {
+        self.parts.join(".")
+    }
+}
+
+fn parse_name(tokens: &[Token], start: usize) -> Option<(Name, usize)> {
+    let mut index = start;
+    let mut parts = vec![identifier(tokens.get(index)?)?];
+    index += 1;
+    while symbol_is(tokens, index, '.') {
+        parts.push(identifier(tokens.get(index + 1)?)?);
+        index += 2;
+    }
+    Some((Name { parts }, index))
+}
+
+fn identifier(token: &Token) -> Option<String> {
+    match &token.kind {
+        TokenKind::Word(value) | TokenKind::QuotedIdentifier(value) => {
+            Some(value.to_ascii_lowercase())
+        }
+        TokenKind::StringLiteral | TokenKind::Symbol(_) => None,
+    }
+}
+
+#[derive(Debug, Default)]
+struct TransactionState {
+    in_transaction: bool,
+    explicit: bool,
+    savepoints: Vec<Name>,
+}
+
+impl TransactionState {
+    fn apply(&mut self, statement: &Statement) {
+        let tokens = &statement.tokens;
+        if token_is(tokens, 0, "BEGIN") {
+            if !self.in_transaction {
+                self.in_transaction = true;
+                self.explicit = true;
+            }
+        } else if token_is(tokens, 0, "SAVEPOINT") {
+            if let Some((name, _)) = parse_name(tokens, 1) {
+                if !self.in_transaction {
+                    self.in_transaction = true;
+                    self.explicit = false;
+                }
+                self.savepoints.push(name);
+            }
+        } else if token_is(tokens, 0, "COMMIT") || token_is(tokens, 0, "END") {
+            self.clear();
+        } else if token_is(tokens, 0, "ROLLBACK") {
+            if token_is(tokens, 1, "TO") {
+                let name_index = if token_is(tokens, 2, "SAVEPOINT") {
+                    3
+                } else {
+                    2
+                };
+                if let Some((name, _)) = parse_name(tokens, name_index)
+                    && let Some(index) = self
+                        .savepoints
+                        .iter()
+                        .rposition(|candidate| candidate.matches(&name))
+                {
+                    self.savepoints.truncate(index + 1);
+                }
+            } else {
+                self.clear();
+            }
+        } else if token_is(tokens, 0, "RELEASE") {
+            let name_index = if token_is(tokens, 1, "SAVEPOINT") {
+                2
+            } else {
+                1
+            };
+            if let Some((name, _)) = parse_name(tokens, name_index)
+                && let Some(index) = self
+                    .savepoints
+                    .iter()
+                    .rposition(|candidate| candidate.matches(&name))
+            {
+                self.savepoints.truncate(index);
+                if self.savepoints.is_empty() && !self.explicit {
+                    self.clear();
+                }
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.in_transaction = false;
+        self.explicit = false;
+        self.savepoints.clear();
+    }
 }
 
 fn is_foreign_keys_off(statement: &Statement) -> bool {
-    token_is(statement, 0, "PRAGMA")
-        && token_is(statement, 1, "foreign_keys")
-        && token_is(statement, 2, "=")
-        && token_is(statement, 3, "OFF")
+    let tokens = &statement.tokens;
+    if !token_is(tokens, 0, "PRAGMA") {
+        return false;
+    }
+    let Some((name, index)) = parse_name(tokens, 1) else {
+        return false;
+    };
+    name.leaf() == "foreign_keys"
+        && name.parts.len() <= 2
+        && symbol_is(tokens, index, '=')
+        && tokens.get(index + 1).is_some_and(|token| {
+            keyword(token, "OFF")
+                || keyword(token, "FALSE")
+                || keyword(token, "NO")
+                || matches!(&token.kind, TokenKind::Word(value) if value == "0")
+        })
+        && tokens.len() == index + 2
 }
 
-fn created_rebuild_table(statement: &Statement) -> Option<String> {
-    if !token_is(statement, 0, "CREATE") {
+fn created_rebuild_table(statement: &Statement) -> Option<Name> {
+    let tokens = &statement.tokens;
+    if !token_is(tokens, 0, "CREATE") {
         return None;
     }
     let mut index = 1;
-    if token_is(statement, index, "TEMP") || token_is(statement, index, "TEMPORARY") {
+    if token_is(tokens, index, "TEMP") || token_is(tokens, index, "TEMPORARY") {
         index += 1;
     }
-    if !token_is(statement, index, "TABLE") {
+    if !token_is(tokens, index, "TABLE") {
         return None;
     }
     index += 1;
-    if token_is(statement, index, "IF")
-        && token_is(statement, index + 1, "NOT")
-        && token_is(statement, index + 2, "EXISTS")
+    if token_is(tokens, index, "IF")
+        && token_is(tokens, index + 1, "NOT")
+        && token_is(tokens, index + 2, "EXISTS")
     {
         index += 3;
     }
-    let table = statement.tokens.get(index)?;
-    table
-        .to_ascii_lowercase()
-        .starts_with("__new_")
-        .then(|| table.to_owned())
+    let (table, _) = parse_name(tokens, index)?;
+    table.leaf().starts_with("__new_").then_some(table)
 }
 
-fn copied_table<'a>(statement: &'a Statement, temporary_table: &str) -> Option<&'a str> {
-    if !token_is(statement, 0, "INSERT") {
+fn copied_table(statement: &Statement) -> Option<(Name, Name)> {
+    let tokens = &statement.tokens;
+    if !token_is(tokens, 0, "INSERT") {
         return None;
     }
-    let into_index = statement
-        .tokens
-        .iter()
-        .position(|token| token.eq_ignore_ascii_case("INTO"))?;
-    let target = statement.tokens.get(into_index + 1)?;
-    if !target.eq_ignore_ascii_case(temporary_table) {
+    let mut index = 1;
+    if token_is(tokens, index, "OR")
+        && (token_is(tokens, index + 1, "IGNORE") || token_is(tokens, index + 1, "REPLACE"))
+    {
+        index += 2;
+    }
+    if !token_is(tokens, index, "INTO") {
         return None;
     }
-    let select_index = statement
-        .tokens
+    let (target, mut index) = parse_name(tokens, index + 1)?;
+    if symbol_is(tokens, index, '(') {
+        index = after_balanced_parentheses(tokens, index)?;
+    }
+    if !token_is(tokens, index, "SELECT") {
+        return None;
+    }
+    let from_index = tokens
         .iter()
         .enumerate()
-        .skip(into_index + 2)
-        .find(|(_, token)| token.eq_ignore_ascii_case("SELECT"))?
+        .skip(index + 1)
+        .find(|(_, token)| keyword(token, "FROM"))?
         .0;
-    let from_index = statement
-        .tokens
-        .iter()
-        .enumerate()
-        .skip(select_index + 1)
-        .find(|(_, token)| token.eq_ignore_ascii_case("FROM"))?
-        .0;
-    statement.tokens.get(from_index + 1).map(String::as_str)
+    let (source, _) = parse_name(tokens, from_index + 1)?;
+    Some((target, source))
 }
 
-fn dropped_table(statement: &Statement) -> Option<&str> {
-    if !token_is(statement, 0, "DROP") || !token_is(statement, 1, "TABLE") {
+fn after_balanced_parentheses(tokens: &[Token], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        if token.kind == TokenKind::Symbol('(') {
+            depth += 1;
+        } else if token.kind == TokenKind::Symbol(')') {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(index + 1);
+            }
+        }
+    }
+    None
+}
+
+fn dropped_table(statement: &Statement) -> Option<Name> {
+    let tokens = &statement.tokens;
+    if !token_is(tokens, 0, "DROP") || !token_is(tokens, 1, "TABLE") {
         return None;
     }
-    let index = if token_is(statement, 2, "IF") && token_is(statement, 3, "EXISTS") {
+    let index = if token_is(tokens, 2, "IF") && token_is(tokens, 3, "EXISTS") {
         4
     } else {
         2
     };
-    statement.tokens.get(index).map(String::as_str)
+    parse_name(tokens, index).map(|(name, _)| name)
 }
 
-fn renamed_table(statement: &Statement) -> Option<(&str, &str)> {
-    if !token_is(statement, 0, "ALTER")
-        || !token_is(statement, 1, "TABLE")
-        || !token_is(statement, 3, "RENAME")
-        || !token_is(statement, 4, "TO")
-    {
+fn renamed_table(statement: &Statement) -> Option<(Name, Name)> {
+    let tokens = &statement.tokens;
+    if !token_is(tokens, 0, "ALTER") || !token_is(tokens, 1, "TABLE") {
         return None;
     }
-    Some((
-        statement.tokens.get(2)?.as_str(),
-        statement.tokens.get(5)?.as_str(),
-    ))
+    let (from, index) = parse_name(tokens, 2)?;
+    if !token_is(tokens, index, "RENAME") || !token_is(tokens, index + 1, "TO") {
+        return None;
+    }
+    let (to, end) = parse_name(tokens, index + 2)?;
+    (end == tokens.len()).then_some((from, to))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateStage {
+    Created,
+    Copied,
+    Dropped,
+}
+
+#[derive(Debug)]
+struct RebuildCandidate {
+    temporary_table: Name,
+    original_table: Option<Name>,
+    create_line: usize,
+    copy_line: usize,
+    drop_line: usize,
+    stage: CandidateStage,
+}
+
+impl RebuildCandidate {
+    fn new(temporary_table: Name, create_line: usize) -> Self {
+        Self {
+            temporary_table,
+            original_table: None,
+            create_line,
+            copy_line: 0,
+            drop_line: 0,
+            stage: CandidateStage::Created,
+        }
+    }
 }
 
 #[cfg(test)]
