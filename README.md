@@ -34,6 +34,19 @@ The first MVP focuses on static detection of high-signal hazards:
 
 Private scout-created repository. Not published.
 
+## Scanner scope and limitations
+
+The scanner is a dependency-free lexical scanner for one SQLite SQL input, not
+a generic SQL parser or a migration executor. It cannot observe transactions
+injected by an ORM or framework, dynamically generated SQL, pragmas selected at
+runtime, or transaction/schema state carried across files. Comments and
+literals are ignored and SQLite trigger bodies are kept together, but malformed
+or non-SQLite dialect input is outside its scope.
+
+A reported rebuild is a structural create/copy/drop/rename pattern anchor. It
+is useful evidence for later diagnostics, not proof by itself that the sequence
+is unsafe.
+
 ## Local checks
 
 ```bash

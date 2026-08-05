@@ -1,5 +1,9 @@
 use std::fmt;
 
+mod scanner;
+
+pub use scanner::{PragmaInTransaction, RebuildSequence, ScanReport, scan_sql};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HazardId {
     CascadeDeleteOnRebuild,
