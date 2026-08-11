@@ -99,8 +99,9 @@ or non-SQLite dialect input is outside its scope.
 A reported rebuild is a structural create/copy/drop/rename pattern anchor. It
 is useful evidence for later diagnostics, not proof by itself that the sequence
 is unsafe. Cascade-reference evidence is derived from `CREATE TABLE` statements
-in the same input; the scanner does not currently model a dependent table being
-dropped or having its foreign key removed before a later parent rebuild.
+in the same input. An explicit `DROP TABLE` of the dependent table before the
+parent rebuild retires that evidence. Foreign keys removed through other table
+changes remain outside the scanner's narrow lifecycle model.
 
 `SQLD003` is likewise evidence-bound: it only tracks indexes and triggers that
 are explicitly created in the same input before the matched rebuild. Objects

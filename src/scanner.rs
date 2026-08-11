@@ -77,7 +77,14 @@ pub struct CascadeReference {
     /// One-based source line containing the cascading reference.
     pub line: usize,
     pub(crate) statement_index: usize,
+    pub(crate) dependent_table_parts: Vec<String>,
     pub(crate) referenced_table_parts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DroppedTable {
+    pub(crate) statement_index: usize,
+    pub(crate) name_parts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -87,6 +94,7 @@ pub struct ScanReport {
     pub cascade_references: Vec<CascadeReference>,
     pub schema_objects: Vec<SchemaObject>,
     pub dropped_schema_objects: Vec<DroppedSchemaObject>,
+    pub(crate) dropped_tables: Vec<DroppedTable>,
 }
 
 /// Scans one SQLite SQL input for transaction-scoped foreign-key pragmas,
@@ -108,6 +116,12 @@ pub fn scan_sql(sql: &str) -> ScanReport {
         }
         if let Some(schema_object) = dropped_schema_object(statement, statement_index) {
             report.dropped_schema_objects.push(schema_object);
+        }
+        if let Some(table) = dropped_table(statement) {
+            report.dropped_tables.push(DroppedTable {
+                statement_index,
+                name_parts: table.parts,
+            });
         }
         report
             .cascade_references
@@ -753,6 +767,7 @@ fn cascade_references(statement: &Statement, statement_index: usize) -> Vec<Casc
                 referenced_table: referenced_table.canonical(),
                 line: tokens[reference_index].line,
                 statement_index,
+                dependent_table_parts: dependent_table.parts.clone(),
                 referenced_table_parts: referenced_table.parts,
             })
         })
@@ -845,7 +860,8 @@ fn dropped_table(statement: &Statement) -> Option<Name> {
     } else {
         2
     };
-    parse_name(tokens, index).map(|(name, _)| name)
+    let (name, end) = parse_name(tokens, index)?;
+    (end == tokens.len()).then_some(name)
 }
 
 fn renamed_table(statement: &Statement) -> Option<(Name, Name)> {

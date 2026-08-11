@@ -148,6 +148,62 @@ CREATE TABLE orders (
 }
 
 #[test]
+fn dropped_dependent_table_does_not_trigger_cascade_risk() {
+    let sql = r#"
+CREATE TABLE "main"."Orders" (
+  account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE
+);
+DROP TABLE IF EXISTS orders;
+CREATE TABLE __new_accounts(id INTEGER PRIMARY KEY);
+INSERT INTO __new_accounts SELECT id FROM accounts;
+DROP TABLE accounts;
+ALTER TABLE __new_accounts RENAME TO accounts;
+"#;
+
+    assert!(diagnose(&scan_sql(sql)).is_empty());
+}
+
+#[test]
+fn recreated_dependent_table_uses_its_current_cascade_evidence() {
+    let sql = r#"
+CREATE TABLE orders (account_id REFERENCES accounts(id) ON DELETE CASCADE);
+DROP TABLE orders;
+CREATE TABLE orders (account_id REFERENCES accounts(id) ON DELETE CASCADE);
+CREATE TABLE __new_accounts(id INTEGER PRIMARY KEY);
+INSERT INTO __new_accounts SELECT id FROM accounts;
+DROP TABLE accounts;
+ALTER TABLE __new_accounts RENAME TO accounts;
+"#;
+
+    let findings = diagnose(&scan_sql(sql));
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|finding| finding.hazard == HazardId::CascadeDeleteOnRebuild)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn malformed_drop_does_not_retire_cascade_evidence() {
+    let sql = r#"
+CREATE TABLE orders (account_id REFERENCES accounts(id) ON DELETE CASCADE);
+DROP TABLE orders unexpected;
+CREATE TABLE __new_accounts(id INTEGER PRIMARY KEY);
+INSERT INTO __new_accounts SELECT id FROM accounts;
+DROP TABLE accounts;
+ALTER TABLE __new_accounts RENAME TO accounts;
+"#;
+
+    assert!(
+        diagnose(&scan_sql(sql))
+            .iter()
+            .any(|finding| finding.hazard == HazardId::CascadeDeleteOnRebuild)
+    );
+}
+
+#[test]
 fn ignored_restore_inside_transaction_emits_pragma_finding() {
     let sql = r#"
 CREATE TABLE orders (account_id REFERENCES accounts(id) ON DELETE CASCADE);
