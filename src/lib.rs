@@ -86,7 +86,8 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
             if reference.statement_index < rebuild.drop_statement_index
                 && rebuild.foreign_keys_enabled_at_drop != Some(false)
                 && !report.dropped_tables.iter().any(|dropped| {
-                    dropped.statement_index > reference.statement_index
+                    !dropped.transaction_scoped
+                        && dropped.statement_index > reference.statement_index
                         && dropped.statement_index < rebuild.drop_statement_index
                         && name_parts_match(&dropped.name_parts, &reference.dependent_table_parts)
                 })

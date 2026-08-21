@@ -85,6 +85,7 @@ pub struct CascadeReference {
 pub(crate) struct DroppedTable {
     pub(crate) statement_index: usize,
     pub(crate) name_parts: Vec<String>,
+    pub(crate) transaction_scoped: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -121,6 +122,7 @@ pub fn scan_sql(sql: &str) -> ScanReport {
             report.dropped_tables.push(DroppedTable {
                 statement_index,
                 name_parts: table.parts,
+                transaction_scoped: transaction.in_transaction,
             });
         }
         report
