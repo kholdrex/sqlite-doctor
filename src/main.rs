@@ -134,7 +134,7 @@ fn print_help() {
     println!("sqlite-doctor [--format human|json] <SQL_FILE|->");
     println!("SQLite migration safety linter for ORM-generated rebuild hazards");
     println!();
-    println!("Initial MVP hazard set:");
+    println!("Diagnostics:");
     for hazard in initial_hazards() {
         println!("- {hazard}");
     }
