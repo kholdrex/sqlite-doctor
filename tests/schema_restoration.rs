@@ -245,3 +245,64 @@ fn qualified_object_names_match_only_compatible_qualification() {
         1
     );
 }
+
+#[test]
+fn index_on_a_column_the_rebuild_removes_is_not_reported() {
+    let recreate = r#"
+CREATE TABLE likes (id integer, post_id integer, user_id integer);
+CREATE INDEX index_likes_on_post_id ON likes (post_id);
+CREATE INDEX index_likes_on_user_id ON likes (user_id);
+CREATE TEMPORARY TABLE alikes (id integer, post_id integer, user_id integer);
+INSERT INTO alikes SELECT id, post_id, user_id FROM likes;
+DROP TABLE likes;
+CREATE TABLE likes (id integer, user_id integer);
+INSERT INTO likes SELECT id, user_id FROM alikes;
+DROP TABLE alikes;
+"#;
+    let findings = diagnose(&scan_sql(recreate));
+    assert_eq!(findings.len(), 1);
+    assert!(findings[0].detail.contains("index_likes_on_user_id"));
+
+    let rename = r#"
+CREATE TABLE likes (id integer, post_id integer);
+CREATE INDEX index_likes_on_post_id ON likes ("post_id" DESC);
+CREATE TABLE __new_likes (id integer);
+INSERT INTO __new_likes SELECT id FROM likes;
+DROP TABLE likes;
+ALTER TABLE __new_likes RENAME TO likes;
+"#;
+    assert!(diagnose(&scan_sql(rename)).is_empty());
+}
+
+#[test]
+fn expression_and_multi_column_indexes_keep_the_conservative_check() {
+    let sql = r#"
+CREATE TABLE users (id integer, email text, name text);
+CREATE INDEX index_users_on_lower_email ON users (lower(email));
+CREATE INDEX index_users_on_name_and_email ON users (name, email COLLATE NOCASE);
+CREATE TEMPORARY TABLE ausers (id integer, email text, name text);
+INSERT INTO ausers SELECT id, email, name FROM users;
+DROP TABLE users;
+CREATE TABLE users (id integer, name text);
+INSERT INTO users SELECT id, name FROM ausers;
+"#;
+    let names: Vec<_> = diagnose(&scan_sql(sql))
+        .into_iter()
+        .map(|finding| finding.detail)
+        .collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(names[0].contains("index_users_on_lower_email"));
+}
+
+#[test]
+fn literal_index_keys_and_unreadable_column_lists_keep_the_conservative_check() {
+    for key in ["1", "NULL", "TRUE", "x'00'", "-1"] {
+        let sql = format!(
+            "CREATE TABLE t(id);\nCREATE INDEX idx ON t({key});\nCREATE TABLE n(id);\nINSERT INTO n SELECT id FROM t;\nDROP TABLE t;\nALTER TABLE n RENAME TO t;\n"
+        );
+        assert_eq!(diagnose(&scan_sql(&sql)).len(), 1, "{key}");
+    }
+
+    let quoted = "CREATE TABLE t(id, 'email' TEXT);\nCREATE INDEX idx ON t(email);\nCREATE TABLE n(id, 'email' TEXT);\nINSERT INTO n SELECT * FROM t;\nDROP TABLE t;\nALTER TABLE n RENAME TO t;\n";
+    assert_eq!(diagnose(&scan_sql(quoted)).len(), 1);
+}

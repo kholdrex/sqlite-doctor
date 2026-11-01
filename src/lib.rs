@@ -174,6 +174,18 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
                 continue;
             }
 
+            // An index on a column the replacement table no longer has cannot
+            // be restored; removing the column removes the index on purpose.
+            let column_removed = schema_object.columns.as_ref().is_some_and(|columns| {
+                rebuild
+                    .replacement_columns
+                    .as_ref()
+                    .is_some_and(|kept| columns.iter().any(|column| !kept.contains(column)))
+            });
+            if column_removed {
+                continue;
+            }
+
             findings.push(
                 Finding::new(
                     HazardId::MissingSchemaObjectRestoration,

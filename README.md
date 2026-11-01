@@ -62,7 +62,9 @@ hazard, and `2` for invalid arguments or unreadable input.
   on a table before rebuilding it, then destroys at `DROP TABLE` without
   recreating the same object name on the replacement or renamed table. Recreate
   the object after dropping the original, or explicitly drop it before the
-  rebuild when removal is intentional.
+  rebuild when removal is intentional. An index on a column that the
+  replacement table no longer has is not reported: removing the column
+  (`remove_column`, `remove_reference`) removes its index on purpose.
 
 For example, this input reports `SQLD003` because SQLite drops
 `idx_users_email` with the original `users` table:
@@ -144,7 +146,10 @@ are explicitly created in the same input before the matched rebuild. Objects
 from an existing database or earlier migration files are intentionally
 invisible, so their omission cannot be diagnosed. Restoration matches object
 kind and normalized name; recreating an equivalent object under a different
-name still reports the original as missing. SQLite does not automatically drop
+name still reports the original as missing. The removed-column exception needs
+plain key columns and a replacement CREATE TABLE with a readable column list;
+expression keys and other cases keep reporting. A column renamed by a rebuild
+counts as removed, so a lost index on the old name is not reported. SQLite does not automatically drop
 views with `DROP TABLE`, so views are not reported as missing restoration by
 this rule.
 

@@ -44,6 +44,9 @@ pub struct RebuildSequence {
     pub(crate) replacement_statement_index: usize,
     pub(crate) temporary_table_parts: Vec<String>,
     pub(crate) original_table_parts: Vec<String>,
+    /// Columns of the table that takes the original name, when its CREATE
+    /// TABLE lists them.
+    pub(crate) replacement_columns: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +74,9 @@ pub struct SchemaObject {
     pub(crate) statement_index: usize,
     pub(crate) name_parts: Vec<String>,
     pub(crate) table_parts: Vec<String>,
+    /// Indexed columns when every key is a plain column; `None` for triggers
+    /// and expression indexes.
+    pub(crate) columns: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +188,7 @@ pub fn scan_sql(sql: &str) -> ScanReport {
             }) {
                 candidate.replacement_line = statement.line;
                 candidate.replacement_statement_index = statement_index;
+                candidate.replacement_columns = table_columns(statement);
                 candidate.stage = CandidateStage::Recreated;
                 recreated = true;
             }
@@ -192,7 +199,11 @@ pub fn scan_sql(sql: &str) -> ScanReport {
             // A replacement table with the same identity supersedes an older,
             // incomplete candidate. Later steps must not finish the old create.
             candidates.retain(|candidate| !candidate.temporary_table.matches(&created));
-            candidates.push(RebuildCandidate::new(created, statement.line));
+            candidates.push(RebuildCandidate::new(
+                created,
+                statement.line,
+                table_columns(statement),
+            ));
             continue;
         }
 
@@ -716,6 +727,60 @@ fn created_table(statement: &Statement) -> Option<(Name, usize)> {
     parse_name(tokens, index)
 }
 
+/// Plain column keys of an index, optionally with COLLATE and ASC/DESC.
+fn index_columns(tokens: &[Token], opening_parenthesis: usize) -> Option<Vec<String>> {
+    table_definition_ranges(tokens, opening_parenthesis)
+        .into_iter()
+        .map(|(start, end)| {
+            let column = identifier(&tokens[start])?;
+            // A bare word can still be a literal: 1, NULL, TRUE, CURRENT_TIME.
+            let literal = matches!(&tokens[start].kind, TokenKind::Word(_))
+                && (column.starts_with(|ch: char| ch.is_ascii_digit())
+                    || [
+                        "null",
+                        "true",
+                        "false",
+                        "current_time",
+                        "current_date",
+                        "current_timestamp",
+                    ]
+                    .contains(&column.as_str()));
+            if literal {
+                return None;
+            }
+            let mut index = start + 1;
+            if token_is(tokens, index, "COLLATE") {
+                identifier(tokens.get(index + 1)?)?;
+                index += 2;
+            }
+            if token_is(tokens, index, "ASC") || token_is(tokens, index, "DESC") {
+                index += 1;
+            }
+            (index == end).then_some(column)
+        })
+        .collect()
+}
+
+/// Column names of a CREATE TABLE with a column list; `None` for AS SELECT.
+fn table_columns(statement: &Statement) -> Option<Vec<String>> {
+    let (_, opening_parenthesis) = created_table(statement)?;
+    let tokens = &statement.tokens;
+    if !symbol_is(tokens, opening_parenthesis, '(') {
+        return None;
+    }
+    // A declaration whose name cannot be read (a single-quoted name) makes the
+    // whole list unknown rather than silently shorter.
+    table_definition_ranges(tokens, opening_parenthesis)
+        .into_iter()
+        .filter(|(start, _)| {
+            !["CONSTRAINT", "PRIMARY", "FOREIGN", "UNIQUE", "CHECK"]
+                .iter()
+                .any(|keyword| token_is(tokens, *start, keyword))
+        })
+        .map(|(start, _)| identifier(&tokens[start]))
+        .collect()
+}
+
 fn created_schema_object(statement: &Statement, statement_index: usize) -> Option<SchemaObject> {
     created_index(statement, statement_index)
         .or_else(|| created_trigger(statement, statement_index))
@@ -744,7 +809,10 @@ fn created_index(statement: &Statement, statement_index: usize) -> Option<Schema
     if !token_is(tokens, index, "ON") {
         return None;
     }
-    let (table, _) = parse_name(tokens, index + 1)?;
+    let (table, index) = parse_name(tokens, index + 1)?;
+    let columns = symbol_is(tokens, index, '(')
+        .then(|| index_columns(tokens, index))
+        .flatten();
     Some(SchemaObject {
         kind: SchemaObjectKind::Index,
         name: name.canonical(),
@@ -753,6 +821,7 @@ fn created_index(statement: &Statement, statement_index: usize) -> Option<Schema
         statement_index,
         name_parts: name.parts,
         table_parts: table.parts,
+        columns,
     })
 }
 
@@ -795,6 +864,7 @@ fn created_trigger(statement: &Statement, statement_index: usize) -> Option<Sche
         statement_index,
         name_parts: name.parts,
         table_parts: table.parts,
+        columns: None,
     })
 }
 
@@ -1012,13 +1082,15 @@ struct RebuildCandidate {
     drop_statement_index: usize,
     replacement_statement_index: usize,
     foreign_keys_enabled_at_drop: Option<bool>,
+    replacement_columns: Option<Vec<String>>,
     stage: CandidateStage,
 }
 
 impl RebuildCandidate {
-    fn new(temporary_table: Name, create_line: usize) -> Self {
+    fn new(temporary_table: Name, create_line: usize, columns: Option<Vec<String>>) -> Self {
         Self {
             temporary_table,
+            replacement_columns: columns,
             original_table: None,
             create_line,
             copy_line: 0,
@@ -1048,6 +1120,7 @@ impl RebuildCandidate {
             replacement_statement_index: self.replacement_statement_index,
             temporary_table_parts: self.temporary_table.parts,
             original_table_parts: original.parts,
+            replacement_columns: self.replacement_columns,
         }
     }
 }
