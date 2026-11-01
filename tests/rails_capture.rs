@@ -187,3 +187,18 @@ fn two_holding_copies_of_one_dropped_table_report_one_rebuild() {
     assert_eq!(scan_sql(sql).rebuilds.len(), 1);
     assert_eq!(codes(sql), vec![("SQLD001", 11), ("SQLD003", 11)]);
 }
+
+#[test]
+fn a_qualified_self_copy_does_not_consume_the_rebuild_candidate() {
+    let sql = include_str!("fixtures/qualified_self_copy_before_rebuild.sql");
+
+    assert_eq!(codes(sql), vec![("SQLD001", 10), ("SQLD003", 10)]);
+}
+
+#[test]
+fn a_qualified_self_copy_is_not_a_rebuild() {
+    let sql = include_str!("fixtures/qualified_self_copy_is_not_a_rebuild.sql");
+
+    assert!(scan_sql(sql).rebuilds.is_empty());
+    assert!(codes(sql).is_empty());
+}

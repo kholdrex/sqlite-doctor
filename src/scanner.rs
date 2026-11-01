@@ -162,9 +162,11 @@ pub fn scan_sql(sql: &str) -> ScanReport {
     }
 
     let mut candidates = Vec::<RebuildCandidate>::new();
+    let mut temp_tables = TempTables::default();
     for (statement_index, (statement, foreign_keys_enabled)) in
         statements.iter().zip(foreign_key_states).enumerate()
     {
+        temp_tables.apply(statement);
         if let Some((created, _)) = created_table(statement) {
             // Recreating the dropped original under its own name is the
             // replacement step of the copy-out/copy-back shape Rails emits.
@@ -213,9 +215,8 @@ pub fn scan_sql(sql: &str) -> ScanReport {
         }
 
         if let Some((temporary_table, original_table)) = copied_table(statement) {
-            // Only an exact name is the same table: an unqualified temp table
-            // may shadow `main.t` and hold its rows.
-            if temporary_table == original_table {
+            // `t` and `main.t` are one table unless a temp `t` shadows it.
+            if temp_tables.resolve(&temporary_table) == temp_tables.resolve(&original_table) {
                 continue;
             }
             if let Some(candidate) = candidates.iter_mut().rev().find(|candidate| {
@@ -649,6 +650,42 @@ fn numeric_pragma_value(token: &Token) -> Option<bool> {
     match &token.kind {
         TokenKind::Word(word) => word.parse::<i64>().ok().map(|value| value != 0),
         _ => None,
+    }
+}
+
+/// Temporary tables that exist at a point in the input, so an unqualified name
+/// can be resolved the way SQLite does: `temp` first, then `main`.
+#[derive(Default)]
+struct TempTables {
+    names: Vec<String>,
+}
+
+impl TempTables {
+    /// Updates the set for the statement. Called before the statement's own
+    /// copy is resolved; only CREATE and DROP change it.
+    fn apply(&mut self, statement: &Statement) {
+        let tokens = &statement.tokens;
+        if let Some((name, _)) = created_table(statement) {
+            let temporary = token_is(tokens, 1, "TEMP")
+                || token_is(tokens, 1, "TEMPORARY")
+                || name.parts.first().is_some_and(|schema| schema == "temp");
+            if temporary && !self.names.iter().any(|leaf| leaf == name.leaf()) {
+                self.names.push(name.leaf().to_string());
+            }
+        } else if let Some(name) = dropped_table(statement)
+            && self.resolve(&name).0 == "temp"
+        {
+            self.names.retain(|leaf| leaf != name.leaf());
+        }
+    }
+
+    fn resolve<'a>(&self, name: &'a Name) -> (&'a str, &'a str) {
+        let leaf = name.leaf();
+        match name.parts.as_slice() {
+            [schema, _] => (schema.as_str(), leaf),
+            _ if self.names.iter().any(|temp| temp == leaf) => ("temp", leaf),
+            _ => ("main", leaf),
+        }
     }
 }
 
