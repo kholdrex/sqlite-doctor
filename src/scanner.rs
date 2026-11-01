@@ -15,20 +15,33 @@ pub struct ForeignKeysPragmaInTransaction {
     pub requested_enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebuildKind {
+    /// Create a replacement, copy rows into it, drop the original, then rename
+    /// the replacement (Drizzle, SQLite's documented procedure).
+    Rename,
+    /// Copy rows out to a holding table, drop the original, recreate it under
+    /// its own name, then copy the rows back (Rails `alter_table`).
+    Recreate,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebuildSequence {
+    pub kind: RebuildKind,
     pub temporary_table: String,
     pub original_table: String,
     /// One-based source lines for each statement in the rebuild sequence.
     pub create_line: usize,
     pub copy_line: usize,
     pub drop_line: usize,
-    pub rename_line: usize,
+    /// The `ALTER TABLE ... RENAME TO` or the `CREATE TABLE` that gives the
+    /// replacement the original name.
+    pub replacement_line: usize,
     /// Effective lexical `PRAGMA foreign_keys` state at the drop. `None`
     /// means the input did not establish a state the scanner can observe.
     pub foreign_keys_enabled_at_drop: Option<bool>,
     pub(crate) drop_statement_index: usize,
-    pub(crate) rename_statement_index: usize,
+    pub(crate) replacement_statement_index: usize,
     pub(crate) temporary_table_parts: Vec<String>,
     pub(crate) original_table_parts: Vec<String>,
 }
@@ -132,11 +145,43 @@ pub fn scan_sql(sql: &str) -> ScanReport {
     for (statement_index, (statement, foreign_keys_enabled)) in
         statements.iter().zip(foreign_key_states).enumerate()
     {
-        if let Some(temporary_table) = created_rebuild_table(statement) {
+        if let Some((created, _)) = created_table(statement) {
+            // Recreating the dropped original under its own name is the
+            // replacement step of the copy-out/copy-back shape Rails emits.
+            if let Some(candidate) = candidates.iter_mut().rev().find(|candidate| {
+                candidate.stage == CandidateStage::Dropped
+                    && candidate
+                        .original_table
+                        .as_ref()
+                        .is_some_and(|name| name.matches(&created))
+            }) {
+                candidate.replacement_line = statement.line;
+                candidate.replacement_statement_index = statement_index;
+                candidate.stage = CandidateStage::Recreated;
+                continue;
+            }
+
             // A replacement table with the same identity supersedes an older,
             // incomplete candidate. Later steps must not finish the old create.
-            candidates.retain(|candidate| !candidate.temporary_table.matches(&temporary_table));
-            candidates.push(RebuildCandidate::new(temporary_table, statement.line));
+            candidates.retain(|candidate| !candidate.temporary_table.matches(&created));
+            candidates.push(RebuildCandidate::new(created, statement.line));
+            continue;
+        }
+
+        if let Some((target, source)) = copied_table(statement)
+            && let Some(index) = candidates.iter().rposition(|candidate| {
+                candidate.stage == CandidateStage::Recreated
+                    && candidate.temporary_table.matches(&source)
+                    && candidate
+                        .original_table
+                        .as_ref()
+                        .is_some_and(|name| name.matches(&target))
+            })
+        {
+            let candidate = candidates.remove(index);
+            report
+                .rebuilds
+                .push(candidate.finish(RebuildKind::Recreate));
             continue;
         }
 
@@ -178,23 +223,10 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                         .is_some_and(|name| name.matches(&original_table))
             })
         {
-            let candidate = candidates.remove(index);
-            let original = candidate
-                .original_table
-                .expect("a dropped candidate has an original table");
-            report.rebuilds.push(RebuildSequence {
-                temporary_table: candidate.temporary_table.canonical(),
-                original_table: original.canonical(),
-                create_line: candidate.create_line,
-                copy_line: candidate.copy_line,
-                drop_line: candidate.drop_line,
-                rename_line: statement.line,
-                foreign_keys_enabled_at_drop: candidate.foreign_keys_enabled_at_drop,
-                drop_statement_index: candidate.drop_statement_index,
-                rename_statement_index: statement_index,
-                temporary_table_parts: candidate.temporary_table.parts,
-                original_table_parts: original.parts,
-            });
+            let mut candidate = candidates.remove(index);
+            candidate.replacement_line = statement.line;
+            candidate.replacement_statement_index = statement_index;
+            report.rebuilds.push(candidate.finish(RebuildKind::Rename));
         }
     }
 
@@ -584,11 +616,6 @@ fn numeric_pragma_value(token: &Token) -> Option<bool> {
     }
 }
 
-fn created_rebuild_table(statement: &Statement) -> Option<Name> {
-    let (table, _) = created_table(statement)?;
-    table.leaf().starts_with("__new_").then_some(table)
-}
-
 fn created_table(statement: &Statement) -> Option<(Name, usize)> {
     let tokens = &statement.tokens;
     if !token_is(tokens, 0, "CREATE") {
@@ -866,6 +893,7 @@ enum CandidateStage {
     Created,
     Copied,
     Dropped,
+    Recreated,
 }
 
 #[derive(Debug)]
@@ -875,7 +903,9 @@ struct RebuildCandidate {
     create_line: usize,
     copy_line: usize,
     drop_line: usize,
+    replacement_line: usize,
     drop_statement_index: usize,
+    replacement_statement_index: usize,
     foreign_keys_enabled_at_drop: Option<bool>,
     stage: CandidateStage,
 }
@@ -888,9 +918,31 @@ impl RebuildCandidate {
             create_line,
             copy_line: 0,
             drop_line: 0,
+            replacement_line: 0,
             drop_statement_index: 0,
+            replacement_statement_index: 0,
             foreign_keys_enabled_at_drop: None,
             stage: CandidateStage::Created,
+        }
+    }
+
+    fn finish(self, kind: RebuildKind) -> RebuildSequence {
+        let original = self
+            .original_table
+            .expect("a dropped candidate has an original table");
+        RebuildSequence {
+            kind,
+            temporary_table: self.temporary_table.canonical(),
+            original_table: original.canonical(),
+            create_line: self.create_line,
+            copy_line: self.copy_line,
+            drop_line: self.drop_line,
+            replacement_line: self.replacement_line,
+            foreign_keys_enabled_at_drop: self.foreign_keys_enabled_at_drop,
+            drop_statement_index: self.drop_statement_index,
+            replacement_statement_index: self.replacement_statement_index,
+            temporary_table_parts: self.temporary_table.parts,
+            original_table_parts: original.parts,
         }
     }
 }

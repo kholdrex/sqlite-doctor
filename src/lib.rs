@@ -3,8 +3,8 @@ use std::fmt;
 mod scanner;
 
 pub use scanner::{
-    CascadeReference, DroppedSchemaObject, ForeignKeysPragmaInTransaction, RebuildSequence,
-    ScanReport, SchemaObject, SchemaObjectKind, scan_sql,
+    CascadeReference, DroppedSchemaObject, ForeignKeysPragmaInTransaction, RebuildKind,
+    RebuildSequence, ScanReport, SchemaObject, SchemaObjectKind, scan_sql,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,12 +147,12 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
             let restored = report.schema_objects.iter().any(|candidate| {
                 let same_identity = candidate.kind == schema_object.kind
                     && name_parts_match(&candidate.name_parts, &schema_object.name_parts);
-                let restored_before_rename = candidate.statement_index
-                    > rebuild.drop_statement_index
-                    && candidate.statement_index < rebuild.rename_statement_index
+                let restored_before_rename = rebuild.kind == RebuildKind::Rename
+                    && candidate.statement_index > rebuild.drop_statement_index
+                    && candidate.statement_index < rebuild.replacement_statement_index
                     && name_parts_match(&candidate.table_parts, &rebuild.temporary_table_parts);
                 let restored_after_rename = candidate.statement_index
-                    > rebuild.rename_statement_index
+                    > rebuild.replacement_statement_index
                     && name_parts_match(
                         effective_table_parts(candidate, &report.rebuilds),
                         &rebuild.original_table_parts,
@@ -209,8 +209,9 @@ fn effective_table_parts<'a>(
         .iter()
         .rev()
         .find(|rebuild| {
-            schema_object.statement_index > rebuild.drop_statement_index
-                && schema_object.statement_index < rebuild.rename_statement_index
+            rebuild.kind == RebuildKind::Rename
+                && schema_object.statement_index > rebuild.drop_statement_index
+                && schema_object.statement_index < rebuild.replacement_statement_index
                 && name_parts_match(&schema_object.table_parts, &rebuild.temporary_table_parts)
         })
         .map_or(&schema_object.table_parts, |rebuild| {

@@ -18,7 +18,7 @@ fn rails_fixture_detects_transaction_pragma_and_rebuild() {
     assert_eq!(rebuild.create_line, 5);
     assert_eq!(rebuild.copy_line, 9);
     assert_eq!(rebuild.drop_line, 11);
-    assert_eq!(rebuild.rename_line, 12);
+    assert_eq!(rebuild.replacement_line, 12);
 }
 
 #[test]
