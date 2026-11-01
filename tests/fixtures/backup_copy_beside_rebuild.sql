@@ -1,0 +1,12 @@
+PRAGMA foreign_keys=ON;
+CREATE TABLE users(id INTEGER PRIMARY KEY);
+CREATE TABLE children(user_id INTEGER REFERENCES users(id) ON DELETE CASCADE);
+CREATE INDEX users_idx ON users(id);
+INSERT INTO users VALUES(1);
+INSERT INTO children VALUES(1);
+CREATE TABLE __new_users(id INTEGER PRIMARY KEY);
+INSERT INTO __new_users SELECT * FROM users;
+CREATE TABLE users_backup(id INTEGER);
+INSERT INTO users_backup SELECT * FROM users;
+DROP TABLE users;
+ALTER TABLE __new_users RENAME TO users;

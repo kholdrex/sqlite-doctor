@@ -168,7 +168,10 @@ pub fn scan_sql(sql: &str) -> ScanReport {
         if let Some((created, _)) = created_table(statement) {
             // Recreating the dropped original under its own name is the
             // replacement step of the copy-out/copy-back shape Rails emits.
-            if let Some(candidate) = candidates.iter_mut().rev().find(|candidate| {
+            // Every holding table copied from it stays a candidate; the
+            // copy-back decides which one was the rebuild.
+            let mut recreated = false;
+            for candidate in candidates.iter_mut().filter(|candidate| {
                 candidate.stage == CandidateStage::Dropped
                     && candidate
                         .original_table
@@ -178,6 +181,9 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 candidate.replacement_line = statement.line;
                 candidate.replacement_statement_index = statement_index;
                 candidate.stage = CandidateStage::Recreated;
+                recreated = true;
+            }
+            if recreated {
                 continue;
             }
 
@@ -206,6 +212,9 @@ pub fn scan_sql(sql: &str) -> ScanReport {
         }
 
         if let Some((temporary_table, original_table)) = copied_table(statement) {
+            if temporary_table.matches(&original_table) {
+                continue;
+            }
             if let Some(candidate) = candidates.iter_mut().rev().find(|candidate| {
                 candidate.stage == CandidateStage::Created
                     && candidate.temporary_table.matches(&temporary_table)
@@ -218,7 +227,10 @@ pub fn scan_sql(sql: &str) -> ScanReport {
         }
 
         if let Some(original_table) = dropped_table(statement) {
-            if let Some(candidate) = candidates.iter_mut().rev().find(|candidate| {
+            // A backup copy of the same table must not consume the drop that
+            // belongs to the real rebuild, so every copy advances; the rename
+            // or copy-back completes only the one that replaces the original.
+            for candidate in candidates.iter_mut().filter(|candidate| {
                 candidate.stage == CandidateStage::Copied
                     && candidate
                         .original_table

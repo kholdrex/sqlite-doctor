@@ -133,3 +133,41 @@ INSERT INTO parents SELECT id FROM aparents;
         }
     }
 }
+
+#[test]
+fn a_backup_copy_does_not_hide_the_rebuild_that_drops_the_same_table() {
+    let sql = include_str!("fixtures/backup_copy_beside_rebuild.sql");
+    let report = scan_sql(sql);
+
+    assert_eq!(report.rebuilds.len(), 1);
+    assert_eq!(report.rebuilds[0].temporary_table, "__new_users");
+    assert_eq!(codes(sql), vec![("SQLD001", 11), ("SQLD003", 11)]);
+}
+
+#[test]
+fn a_backup_holding_table_does_not_hide_the_recreate_rebuild() {
+    let sql = r#"
+CREATE TABLE parents (id integer);
+CREATE TABLE children (parent_id integer REFERENCES parents(id) ON DELETE CASCADE);
+CREATE TABLE aparents (id integer);
+INSERT INTO aparents SELECT id FROM parents;
+CREATE TABLE parents_backup (id integer);
+INSERT INTO parents_backup SELECT id FROM parents;
+DROP TABLE parents;
+CREATE TABLE parents (id integer, name text);
+INSERT INTO parents SELECT id FROM aparents;
+"#;
+    let report = scan_sql(sql);
+
+    assert_eq!(report.rebuilds.len(), 1);
+    assert_eq!(report.rebuilds[0].temporary_table, "aparents");
+    assert_eq!(codes(sql), vec![("SQLD001", 8)]);
+}
+
+#[test]
+fn copying_a_table_into_itself_is_not_a_rebuild() {
+    let sql = include_str!("fixtures/self_copy_is_not_a_rebuild.sql");
+
+    assert!(scan_sql(sql).rebuilds.is_empty());
+    assert!(codes(sql).is_empty());
+}

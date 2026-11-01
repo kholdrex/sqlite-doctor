@@ -1,0 +1,8 @@
+CREATE TABLE t(id INTEGER);
+CREATE INDEX old_idx ON t(id);
+INSERT INTO t VALUES(1);
+INSERT INTO t SELECT id+1 FROM t;
+DROP TABLE t;
+CREATE TABLE t(id INTEGER, description TEXT);
+INSERT INTO t VALUES(10, 'new content');
+INSERT INTO t SELECT id+1, description FROM t;
