@@ -78,28 +78,59 @@ ALTER TABLE __new_users RENAME TO users;
 Recreating `idx_users_email` on either `__new_users` after the drop or `users`
 after the rename makes the restoration explicit and suppresses the finding.
 
-### Rails and Drizzle workflows
+### Rails workflow
 
-For Rails, scan the SQL emitted for a migration together with relevant index and
-trigger declarations from the schema snapshot when you want `SQLD003` coverage;
-a migration fragment alone cannot prove which objects already exist. For
-Drizzle, scan the generated SQLite migration SQL and include the earlier object
-creation statements in the same input when checking a rebuild sequence. In both
-workflows, a finding is intentionally based only on object lifecycle evidence
-visible in that combined input.
+A Rails migration file does not contain the SQL that decides whether a rebuild
+deletes rows: ActiveRecord opens the transaction, turns `foreign_keys` off inside
+it (a no-op), and rebuilds the table by copying it to a holding table, dropping
+it, recreating it and copying the rows back. Capture what actually runs instead.
+Copy `contrib/rails/sqlite_doctor_capture.rb` and `contrib/rails/sqlite_doctor.rake`
+into `lib/tasks/`, then:
+
+```bash
+bin/rails sqlite_doctor:capture OUTPUT=tmp/migration.sql
+sqlite-doctor tmp/migration.sql
+```
+
+The task points ActiveRecord at a `VACUUM INTO` copy of the primary database,
+runs the pending migrations there and writes one SQL input: the baseline
+schema, the connection's `PRAGMA foreign_keys` state and every executed
+statement, including transaction boundaries. Statements that failed are kept
+as comments so they never count as restoring an object, and tables that lost
+rows on the copy are listed in the header. It refuses to start when another
+connection pool uses the same database file or when `OUTPUT` would overwrite
+it, and it fails without writing a capture if the original file changed during
+the run, which happens only when a migration opens its own connection to it.
+The application's connection is restored afterwards. Outside Rails, run
+`ruby sqlite_doctor_capture.rb DATABASE MIGRATIONS_DIR OUTPUT` with
+`activerecord` and `sqlite3` available.
+
+On the 144 Rails 8.1.4 cells of an operation × dependency matrix (16 migration
+operations, 9 dependency contexts) captured this way, `SQLD001` and `SQLD003`
+reported all 48 cells that silently lost rows, foreign-key values or triggers,
+and none of the 96 cells that preserved them.
+
+### Drizzle workflow
+
+Scan the generated SQLite migration SQL and include the earlier object creation
+statements in the same input when checking a rebuild sequence. A finding is
+intentionally based only on object lifecycle evidence visible in that combined
+input.
 
 ## Scanner scope and limitations
 
 The scanner is a dependency-free lexical scanner for one SQLite SQL input, not
-a generic SQL parser or a migration executor. It cannot observe transactions
-injected by an ORM or framework, dynamically generated SQL, pragmas selected at
-runtime, or transaction/schema state carried across files. Comments and
+a generic SQL parser or a migration executor. It sees only its input: a
+transaction, pragma or existing schema object that an ORM or framework adds at
+runtime is invisible unless it is captured into that input, as the Rails
+capture task does. Comments and
 literals are ignored and SQLite trigger bodies are kept together, but malformed
 or non-SQLite dialect input is outside its scope.
 
-A reported rebuild is a structural create/copy/drop/rename pattern anchor. It
+A reported rebuild is a structural pattern anchor: create/copy/drop/rename, or
+the create/copy/drop/recreate/copy-back sequence ActiveRecord emits. It
 is useful evidence for later diagnostics, not proof by itself that the sequence
-is unsafe. Cascade-reference evidence is derived from `CREATE TABLE` statements
+is unsafe. `ON DELETE` reference evidence is derived from `CREATE TABLE` statements
 in the same input; the scanner does not currently model a dependent table being
 dropped or having its foreign key removed before a later parent rebuild.
 

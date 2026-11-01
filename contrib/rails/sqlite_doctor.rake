@@ -12,8 +12,12 @@ namespace :sqlite_doctor do
     abort "sqlite_doctor:capture supports the sqlite3 adapter only" unless db_config.adapter == "sqlite3"
 
     output = ENV.fetch("OUTPUT", "tmp/sqlite-doctor-capture.sql")
+    # The file the connection really opened; Rails resolves relative paths
+    # against Rails.root, not the working directory.
+    database = SqliteDoctorCapture.main_database_path(SqliteDoctorCapture.base_connection)
+    abort "sqlite_doctor:capture needs a file-backed database" unless database
     result = SqliteDoctorCapture.capture(
-      config: db_config.configuration_hash,
+      config: db_config.configuration_hash.merge(database: database),
       migrations_paths: db_config.migrations_paths || ActiveRecord::Migrator.migrations_paths,
       output: output
     )
