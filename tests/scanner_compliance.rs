@@ -111,7 +111,7 @@ ALTER TABLE main.__NEW_USERS RENAME TO [users];
             rebuild.create_line,
             rebuild.copy_line,
             rebuild.drop_line,
-            rebuild.rename_line
+            rebuild.replacement_line
         ),
         (2, 4, 7, 9)
     );

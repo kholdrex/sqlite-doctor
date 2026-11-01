@@ -1,0 +1,13 @@
+PRAGMA foreign_keys=ON;
+CREATE TEMP TABLE staging(id INTEGER PRIMARY KEY);
+INSERT INTO staging VALUES(1);
+ALTER TABLE temp.staging RENAME TO users;
+CREATE TEMP TABLE children(user_id INTEGER REFERENCES users(id) ON DELETE CASCADE);
+CREATE INDEX temp.users_idx ON users(id);
+INSERT INTO children VALUES(1);
+CREATE TABLE main.users(id INTEGER);
+INSERT INTO main.users SELECT * FROM users;
+DROP TABLE temp.users;
+CREATE TEMP TABLE users(id INTEGER PRIMARY KEY, label TEXT);
+INSERT INTO users(id) SELECT id FROM main.users;
+DROP TABLE main.users;

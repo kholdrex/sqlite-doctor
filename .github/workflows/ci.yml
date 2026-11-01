@@ -19,3 +19,18 @@ jobs:
         run: cargo test --all-features
       - name: cargo run
         run: cargo run -- --help
+
+  rails-capture:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        activerecord: ["7.1.5.1", "7.2.2.1", "8.1.4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - name: capture helper tests
+        env:
+          AR_VERSION: ${{ matrix.activerecord }}
+        run: ruby contrib/rails/test/capture_test.rb
