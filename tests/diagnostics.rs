@@ -17,14 +17,17 @@ COMMIT;
 "#;
 
     let report = scan_sql(sql);
-    assert_eq!(report.cascade_references.len(), 1);
-    assert_eq!(report.cascade_references[0].dependent_table, "orders");
-    assert_eq!(report.cascade_references[0].referenced_table, "accounts");
+    assert_eq!(report.delete_action_references.len(), 1);
+    assert_eq!(report.delete_action_references[0].dependent_table, "orders");
+    assert_eq!(
+        report.delete_action_references[0].referenced_table,
+        "accounts"
+    );
 
     let findings = diagnose(&report);
     let cascade = findings
         .iter()
-        .find(|finding| finding.hazard == HazardId::CascadeDeleteOnRebuild)
+        .find(|finding| finding.hazard == HazardId::DeleteActionOnRebuild)
         .expect("cascade risk should be diagnosed");
     assert_eq!(cascade.line, 10);
     assert!(cascade.detail.contains("`orders`"));
@@ -62,7 +65,7 @@ ALTER TABLE __new_teams RENAME TO teams;
     let findings = diagnose(&scan_sql(sql));
     let cascade_details: Vec<_> = findings
         .iter()
-        .filter(|finding| finding.hazard == HazardId::CascadeDeleteOnRebuild)
+        .filter(|finding| finding.hazard == HazardId::DeleteActionOnRebuild)
         .map(|finding| finding.detail.as_str())
         .collect();
 
@@ -94,7 +97,7 @@ ALTER TABLE __new_accounts RENAME TO accounts;
     assert!(
         diagnose(&scan_sql(non_cascade))
             .iter()
-            .all(|finding| finding.hazard != HazardId::CascadeDeleteOnRebuild)
+            .all(|finding| finding.hazard != HazardId::DeleteActionOnRebuild)
     );
 
     let incomplete = r#"
@@ -107,7 +110,7 @@ INSERT INTO __new_accounts SELECT id FROM accounts;
     assert!(
         diagnose(&scan_sql(incomplete))
             .iter()
-            .all(|finding| finding.hazard != HazardId::CascadeDeleteOnRebuild)
+            .all(|finding| finding.hazard != HazardId::DeleteActionOnRebuild)
     );
 }
 
@@ -176,7 +179,7 @@ fn same_line_statements_preserve_reference_before_drop_order() {
     assert!(
         diagnose(&scan_sql(sql))
             .iter()
-            .any(|finding| finding.hazard == HazardId::CascadeDeleteOnRebuild)
+            .any(|finding| finding.hazard == HazardId::DeleteActionOnRebuild)
     );
 }
 
@@ -198,7 +201,7 @@ COMMIT;
     assert!(
         diagnose(&report)
             .iter()
-            .any(|finding| finding.hazard == HazardId::CascadeDeleteOnRebuild)
+            .any(|finding| finding.hazard == HazardId::DeleteActionOnRebuild)
     );
 }
 

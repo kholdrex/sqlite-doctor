@@ -35,7 +35,7 @@ fn rails_rebuild_without_cascading_dependents_is_not_reported_as_data_loss() {
     assert!(
         diagnose(&scan_sql(sql))
             .iter()
-            .all(|finding| finding.hazard != HazardId::CascadeDeleteOnRebuild)
+            .all(|finding| finding.hazard != HazardId::DeleteActionOnRebuild)
     );
 }
 
@@ -101,4 +101,35 @@ DROP TABLE ausers;
 "#;
 
     assert!(codes(sql).is_empty());
+}
+
+#[test]
+fn set_null_and_set_default_dependents_are_reported_but_restrict_is_not() {
+    let rebuild = r#"
+CREATE TEMPORARY TABLE aparents (id integer);
+INSERT INTO aparents SELECT id FROM parents;
+DROP TABLE parents;
+CREATE TABLE parents (id integer, name text);
+INSERT INTO parents SELECT id FROM aparents;
+"#;
+    for (action, reported) in [
+        ("ON DELETE SET NULL", true),
+        ("ON DELETE SET DEFAULT", true),
+        ("ON DELETE RESTRICT", false),
+        ("ON DELETE NO ACTION", false),
+        ("ON UPDATE SET NULL", false),
+    ] {
+        let sql = format!(
+            "CREATE TABLE parents (id integer);\nCREATE TABLE children (parent_id integer REFERENCES parents(id) {action});\n{rebuild}"
+        );
+        let findings: Vec<_> = diagnose(&scan_sql(&sql))
+            .into_iter()
+            .filter(|finding| finding.hazard == HazardId::DeleteActionOnRebuild)
+            .collect();
+        assert_eq!(findings.len(), usize::from(reported), "{action}");
+        if reported {
+            assert!(findings[0].detail.contains(action), "{action}");
+            assert!(findings[0].detail.contains("foreign keys"), "{action}");
+        }
+    }
 }

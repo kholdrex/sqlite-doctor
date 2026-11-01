@@ -83,11 +83,31 @@ pub struct DroppedSchemaObject {
     pub(crate) name_parts: Vec<String>,
 }
 
+/// A foreign-key `ON DELETE` action that rewrites dependent rows when the
+/// referenced row is deleted, including by `DROP TABLE` on the parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteAction {
+    Cascade,
+    SetNull,
+    SetDefault,
+}
+
+impl DeleteAction {
+    pub fn sql(self) -> &'static str {
+        match self {
+            Self::Cascade => "ON DELETE CASCADE",
+            Self::SetNull => "ON DELETE SET NULL",
+            Self::SetDefault => "ON DELETE SET DEFAULT",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CascadeReference {
+pub struct DeleteActionReference {
     pub dependent_table: String,
     pub referenced_table: String,
-    /// One-based source line containing the cascading reference.
+    pub action: DeleteAction,
+    /// One-based source line containing the reference.
     pub line: usize,
     pub(crate) statement_index: usize,
     pub(crate) referenced_table_parts: Vec<String>,
@@ -97,7 +117,7 @@ pub struct CascadeReference {
 pub struct ScanReport {
     pub foreign_keys_pragmas_in_transactions: Vec<ForeignKeysPragmaInTransaction>,
     pub rebuilds: Vec<RebuildSequence>,
-    pub cascade_references: Vec<CascadeReference>,
+    pub delete_action_references: Vec<DeleteActionReference>,
     pub schema_objects: Vec<SchemaObject>,
     pub dropped_schema_objects: Vec<DroppedSchemaObject>,
 }
@@ -123,8 +143,8 @@ pub fn scan_sql(sql: &str) -> ScanReport {
             report.dropped_schema_objects.push(schema_object);
         }
         report
-            .cascade_references
-            .extend(cascade_references(statement, statement_index));
+            .delete_action_references
+            .extend(delete_action_references(statement, statement_index));
         if let Some(enabled) = foreign_keys_setting(statement) {
             if transaction.in_transaction {
                 report
@@ -752,7 +772,10 @@ fn dropped_schema_object(
     })
 }
 
-fn cascade_references(statement: &Statement, statement_index: usize) -> Vec<CascadeReference> {
+fn delete_action_references(
+    statement: &Statement,
+    statement_index: usize,
+) -> Vec<DeleteActionReference> {
     let tokens = &statement.tokens;
     let Some((dependent_table, opening_parenthesis)) = created_table(statement) else {
         return Vec::new();
@@ -770,14 +793,27 @@ fn cascade_references(statement: &Statement, statement_index: usize) -> Vec<Casc
             if symbol_is(tokens, index, '(') {
                 index = after_balanced_parentheses(tokens, index)?;
             }
-            let cascades = (index..end).any(|index| {
-                token_is(tokens, index, "ON")
-                    && token_is(tokens, index + 1, "DELETE")
-                    && token_is(tokens, index + 2, "CASCADE")
-            });
-            (cascades && !dependent_table.matches(&referenced_table)).then(|| CascadeReference {
+            let action = (index..end).find_map(|index| {
+                if !token_is(tokens, index, "ON") || !token_is(tokens, index + 1, "DELETE") {
+                    return None;
+                }
+                if token_is(tokens, index + 2, "CASCADE") {
+                    Some(DeleteAction::Cascade)
+                } else if token_is(tokens, index + 2, "SET") && token_is(tokens, index + 3, "NULL")
+                {
+                    Some(DeleteAction::SetNull)
+                } else if token_is(tokens, index + 2, "SET")
+                    && token_is(tokens, index + 3, "DEFAULT")
+                {
+                    Some(DeleteAction::SetDefault)
+                } else {
+                    None
+                }
+            })?;
+            (!dependent_table.matches(&referenced_table)).then(|| DeleteActionReference {
                 dependent_table: dependent_table.canonical(),
                 referenced_table: referenced_table.canonical(),
+                action,
                 line: tokens[reference_index].line,
                 statement_index,
                 referenced_table_parts: referenced_table.parts,

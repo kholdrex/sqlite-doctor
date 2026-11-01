@@ -3,13 +3,13 @@ use std::fmt;
 mod scanner;
 
 pub use scanner::{
-    CascadeReference, DroppedSchemaObject, ForeignKeysPragmaInTransaction, RebuildKind,
-    RebuildSequence, ScanReport, SchemaObject, SchemaObjectKind, scan_sql,
+    DeleteAction, DeleteActionReference, DroppedSchemaObject, ForeignKeysPragmaInTransaction,
+    RebuildKind, RebuildSequence, ScanReport, SchemaObject, SchemaObjectKind, scan_sql,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HazardId {
-    CascadeDeleteOnRebuild,
+    DeleteActionOnRebuild,
     ForeignKeysPragmaInsideTransaction,
     MissingSchemaObjectRestoration,
 }
@@ -17,7 +17,7 @@ pub enum HazardId {
 impl HazardId {
     pub fn code(self) -> &'static str {
         match self {
-            Self::CascadeDeleteOnRebuild => "SQLD001",
+            Self::DeleteActionOnRebuild => "SQLD001",
             Self::ForeignKeysPragmaInsideTransaction => "SQLD002",
             Self::MissingSchemaObjectRestoration => "SQLD003",
         }
@@ -25,7 +25,9 @@ impl HazardId {
 
     pub fn title(self) -> &'static str {
         match self {
-            Self::CascadeDeleteOnRebuild => "table rebuild may trigger ON DELETE CASCADE data loss",
+            Self::DeleteActionOnRebuild => {
+                "table rebuild may fire ON DELETE actions on dependent rows"
+            }
             Self::ForeignKeysPragmaInsideTransaction => {
                 "PRAGMA foreign_keys inside a transaction is a no-op"
             }
@@ -75,14 +77,14 @@ impl Finding {
 
 /// Converts scanner evidence into actionable diagnostics.
 ///
-/// `SQLD001` requires both a complete rebuild and an explicit cascading
-/// reference in the same input. This deliberately avoids claiming knowledge of
+/// `SQLD001` requires both a complete rebuild and an explicit `ON DELETE
+/// CASCADE`, `SET NULL` or `SET DEFAULT` reference in the same input. This deliberately avoids claiming knowledge of
 /// schema state that the scanner cannot see.
 pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     for rebuild in &report.rebuilds {
-        for reference in &report.cascade_references {
+        for reference in &report.delete_action_references {
             if reference.statement_index < rebuild.drop_statement_index
                 && rebuild.foreign_keys_enabled_at_drop != Some(false)
                 && name_parts_match(
@@ -92,11 +94,20 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
             {
                 findings.push(
                     Finding::new(
-                        HazardId::CascadeDeleteOnRebuild,
+                        HazardId::DeleteActionOnRebuild,
                         rebuild.drop_line,
                         format!(
-                            "Dependent table `{}` references rebuilt table `{}` with ON DELETE CASCADE on line {}; dropping the original table can delete dependent rows while foreign-key enforcement is active.",
-                            reference.dependent_table, rebuild.original_table, reference.line
+                            "Dependent table `{}` references rebuilt table `{}` with {} on line {}; dropping the original table {} while foreign-key enforcement is active.",
+                            reference.dependent_table,
+                            rebuild.original_table,
+                            reference.action.sql(),
+                            reference.line,
+                            match reference.action {
+                                DeleteAction::Cascade => "can delete dependent rows",
+                                DeleteAction::SetNull => "can set dependent foreign keys to NULL",
+                                DeleteAction::SetDefault =>
+                                    "can reset dependent foreign keys to their default",
+                            }
                         ),
                         "Disable foreign-key enforcement before starting the transaction, perform the rebuild, then restore enforcement and run PRAGMA foreign_key_check; prefer a native ALTER TABLE or staged migration when available.",
                     )
@@ -231,7 +242,7 @@ fn name_parts_match(left: &[String], right: &[String]) -> bool {
 
 pub fn initial_hazards() -> Vec<HazardId> {
     vec![
-        HazardId::CascadeDeleteOnRebuild,
+        HazardId::DeleteActionOnRebuild,
         HazardId::ForeignKeysPragmaInsideTransaction,
         HazardId::MissingSchemaObjectRestoration,
     ]
@@ -258,13 +269,13 @@ mod tests {
     #[test]
     fn finding_constructor_populates_fields() {
         let finding = Finding::new(
-            HazardId::CascadeDeleteOnRebuild,
+            HazardId::DeleteActionOnRebuild,
             12,
             "Detected rebuild sequence with dependent child tables.",
             "Use a safer staged migration or avoid rebuild when adding the constraint.",
         );
 
-        assert_eq!(finding.hazard, HazardId::CascadeDeleteOnRebuild);
+        assert_eq!(finding.hazard, HazardId::DeleteActionOnRebuild);
         assert_eq!(finding.line, 12);
         assert_eq!(finding.related_line, None);
         assert!(finding.detail.contains("rebuild sequence"));

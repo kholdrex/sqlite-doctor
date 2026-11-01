@@ -18,7 +18,7 @@ SQLite supports only a limited `ALTER TABLE` surface. ORMs often emulate richer 
 
 The first MVP focuses on static detection of high-signal hazards:
 
-1. Table rebuilds that can trigger child-row deletion through `ON DELETE CASCADE`
+1. Table rebuilds that can delete child rows through `ON DELETE CASCADE` or rewrite their foreign keys through `ON DELETE SET NULL` / `SET DEFAULT`
 2. `PRAGMA foreign_keys=OFF` inside a transaction, where SQLite treats it as a no-op
 3. Rebuilds that recreate a table but omit explicit follow-up restoration of indexes or triggers
 4. ORM-oriented guidance with concrete safer rewrite suggestions
@@ -52,7 +52,8 @@ The CLI exits with `0` when the input is clean, `1` when it finds a supported
 hazard, and `2` for invalid arguments or unreadable input.
 
 - `SQLD001` reports a complete table rebuild when the same input also defines
-  an existing dependent table with an explicit `ON DELETE CASCADE` reference.
+  an existing dependent table with an explicit `ON DELETE CASCADE`, `SET NULL`
+  or `SET DEFAULT` reference.
   A safe `PRAGMA foreign_keys=OFF` before the transaction suppresses that
   finding.
 - `SQLD002` reports `PRAGMA foreign_keys` assignments inside a transaction,
