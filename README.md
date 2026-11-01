@@ -110,7 +110,10 @@ application's connection is restored afterwards. Outside Rails, run
 On the 144 Rails 8.1.4 cells of an operation × dependency matrix (16 migration
 operations, 9 dependency contexts) captured this way, `SQLD001` and `SQLD003`
 reported all 48 cells that silently lost rows, foreign-key values or triggers,
-and none of the 96 cells that preserved them.
+and none of the 96 cells that preserved them. On the same SQL, `atlas migrate
+lint` (Community Edition v1.3.0) reports its generic destructive-change check,
+`DS102` "Dropping table", for every one of the 117 rebuilds, including the 69
+that lost nothing, and none of its diagnostics name the dependent table.
 
 ### Drizzle workflow
 
