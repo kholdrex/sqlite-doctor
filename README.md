@@ -1,73 +1,48 @@
 # sqlite-doctor
 
-SQLite migration safety linter for ORM-generated rebuild hazards.
-
-## Thesis
-
-SQLite supports only a limited `ALTER TABLE` surface. ORMs often emulate richer changes by rebuilding tables, copying rows, dropping the original table, and renaming the replacement. That pattern can silently destroy data or drop schema objects when foreign keys, cascades, triggers, indexes, views, or transaction-scoped pragmas interact badly.
-
-`sqlite-doctor` is a local-first CLI and future GitHub Action that will lint migration files and generated SQL for these rebuild hazards before they reach production.
-
-## Initial target users
-
-- Rails apps using SQLite in production or durable single-tenant deployments
-- Drizzle / better-sqlite3 / libSQL / Turso projects shipping generated SQLite migrations
-- Teams that want CI warnings before a schema change can trigger cascade deletes or lose schema objects during a rebuild
-
-## Planned MVP
-
-The first MVP focuses on static detection of high-signal hazards:
-
-1. Table rebuilds that can delete child rows through `ON DELETE CASCADE` or rewrite their foreign keys through `ON DELETE SET NULL` / `SET DEFAULT`
-2. `PRAGMA foreign_keys=OFF` inside a transaction, where SQLite treats it as a no-op
-3. Rebuilds that recreate a table but omit explicit follow-up restoration of indexes or triggers
-4. ORM-oriented guidance with concrete safer rewrite suggestions
-
-## Evidence summary
-
-- Rails issue `#55866` and follow-up PR `#55907` documented SQLite migration data loss during table alterations.
-- Rails follow-up PR `#57128` remains open and documents transaction-wrapped rebuild corruption/data-loss cases.
-- Drizzle issues `#4938` and `#5782` document the same class of silent cascade data loss in a second ecosystem.
-- SQLite's official docs explain that `PRAGMA foreign_keys` is a no-op within a transaction and that richer schema changes require careful rebuild workflows.
-
-## Development status
-
-Private scout-created repository. Not published.
-
-## CLI usage
-
-Scan a SQL file with human-readable diagnostics:
+Finds SQLite migrations that quietly delete or change data when an ORM rebuilds a table.
 
 ```bash
-cargo run -- migration.sql
+cargo install --path .        # from a clone; not on crates.io yet
+sqlite-doctor migration.sql
 ```
 
-Use `-` to read SQL from standard input, or select stable JSON output for CI:
+Exit code `0` means nothing found, `1` means at least one finding, `2` means bad arguments or an unreadable file.
+Add `--format json` for CI, and pass `-` to read from stdin.
 
-```bash
-cat migration.sql | cargo run -- --format json -
-```
+## Why this exists
 
-The CLI exits with `0` when the input is clean, `1` when it finds a supported
-hazard, and `2` for invalid arguments or unreadable input.
+SQLite can't change most column definitions in place, so ORMs rebuild the table: copy the rows out, drop the
+table, create it again, copy the rows back. Dropping the table also fires every `ON DELETE` action that points at
+it. If foreign keys are on, children with `ON DELETE CASCADE` are deleted and children with `ON DELETE SET NULL`
+lose their reference. Turning foreign keys off doesn't help inside a transaction, because SQLite ignores
+`PRAGMA foreign_keys` there.
 
-- `SQLD001` reports a complete table rebuild when the same input also defines
-  an existing dependent table with an explicit `ON DELETE CASCADE`, `SET NULL`
-  or `SET DEFAULT` reference.
-  A safe `PRAGMA foreign_keys=OFF` before the transaction suppresses that
-  finding.
-- `SQLD002` reports `PRAGMA foreign_keys` assignments inside a transaction,
-  where SQLite ignores the attempted state change.
-- `SQLD003` reports an index or trigger that the same input explicitly creates
-  on a table before rebuilding it, then destroys at `DROP TABLE` without
-  recreating the same object name on the replacement or renamed table. Recreate
-  the object after dropping the original, or explicitly drop it before the
-  rebuild when removal is intentional. An index on a column that the
-  replacement table no longer has is not reported: removing the column
-  (`remove_column`, `remove_reference`) removes its index on purpose.
+Rails 8.1 and Drizzle both hit this. A one-line `change_column_null` or `remove_column` on a parent table can empty
+its child tables, and the migration still reports success.
 
-For example, this input reports `SQLD003` because SQLite drops
-`idx_users_email` with the original `users` table:
+## What it reports
+
+| Code | Meaning |
+|---|---|
+| `SQLD001` | A table is rebuilt while a table created earlier in the input references it with `ON DELETE CASCADE`, `SET NULL` or `SET DEFAULT`. Reported unless the input turns foreign keys off before the drop. |
+| `SQLD002` | `PRAGMA foreign_keys` is set inside a transaction, where SQLite ignores it. |
+| `SQLD003` | An index or trigger created on a table before the rebuild is not created again afterwards. |
+
+To rebuild a table safely, follow SQLite's order:
+
+1. `PRAGMA foreign_keys = OFF;` before `BEGIN`
+2. `BEGIN;`, then the rebuild
+3. `PRAGMA foreign_key_check;` and fix what it reports
+4. `COMMIT;`
+5. `PRAGMA foreign_keys = ON;` after `COMMIT`
+
+For `SQLD003`, recreate the index or trigger after the rebuild, or drop it first if you meant to remove it. An
+index on a plain column that the rebuilt table no longer has is not reported, because `remove_column` and
+`remove_reference` drop that index on purpose. Expression indexes, and tables whose column list can't be read,
+are still reported.
+
+Example that reports `SQLD003`, because SQLite drops `idx_users_email` together with `users`:
 
 ```sql
 CREATE INDEX idx_users_email ON users(email);
@@ -77,87 +52,89 @@ DROP TABLE users;
 ALTER TABLE __new_users RENAME TO users;
 ```
 
-Recreating `idx_users_email` on either `__new_users` after the drop or `users`
-after the rename makes the restoration explicit and suppresses the finding.
+## Rails
 
-### Rails workflow
+A migration file doesn't show the SQL that matters: ActiveRecord opens the transaction, sets `foreign_keys = OFF`
+inside it (which does nothing), and rebuilds the table through a holding copy. So scan what actually runs.
 
-A Rails migration file does not contain the SQL that decides whether a rebuild
-deletes rows: ActiveRecord opens the transaction, turns `foreign_keys` off inside
-it (a no-op), and rebuilds the table by copying it to a holding table, dropping
-it, recreating it and copying the rows back. Capture what actually runs instead.
-Copy `contrib/rails/sqlite_doctor_capture.rb` and `contrib/rails/sqlite_doctor.rake`
-into `lib/tasks/`, then:
+1. Copy `contrib/rails/sqlite_doctor_capture.rb` and `contrib/rails/sqlite_doctor.rake` into `lib/tasks/`.
+2. Run `bin/rails sqlite_doctor:capture OUTPUT=tmp/migration.sql`.
+3. Run `sqlite-doctor tmp/migration.sql`.
 
-```bash
-bin/rails sqlite_doctor:capture OUTPUT=tmp/migration.sql
-sqlite-doctor tmp/migration.sql
-```
+The task points ActiveRecord at a `VACUUM INTO` copy of the primary database and runs your pending migrations
+there. The output holds the current schema, the `foreign_keys` setting and every statement the migrations
+executed. Failed statements are kept as comments. Tables that still exist but have fewer rows at the end are
+listed in the header.
 
-The task points ActiveRecord at a `VACUUM INTO` copy of the primary database,
-runs the pending migrations there and writes one SQL input: the baseline
-schema, the connection's `PRAGMA foreign_keys` state and every executed
-statement, including transaction boundaries. Statements that failed are kept
-as comments so they never count as restoring an object, and tables that lost
-rows on the copy are listed in the header. It refuses to start when another
-connection pool uses the same database file or when `OUTPUT` would overwrite
-it, and it fails without writing a capture if another connection committed to
-the original during the run (`PRAGMA data_version`), for example a migration
-that opens its own connection to it. A `wal_checkpoint(TRUNCATE)` by another
-process, as Litestream runs, also trips this check; rerun the task. The
-application's connection is restored afterwards. Outside Rails, run
-`ruby sqlite_doctor_capture.rb DATABASE MIGRATIONS_DIR OUTPUT` with
-`activerecord` and `sqlite3` available.
+Before migrating, it refuses to start when:
 
-On the 144 Rails 8.1.4 cells of an operation × dependency matrix (16 migration
-operations, 9 dependency contexts) captured this way, `SQLD001` and `SQLD003`
-reported all 48 cells that silently lost rows, foreign-key values or triggers,
-and none of the 96 cells that preserved them. On the same SQL, `atlas migrate
-lint` (Community Edition v1.3.0) reports its generic destructive-change check,
-`DS102` "Dropping table", for every one of the 117 rebuilds, including the 69
-that lost nothing, and none of its diagnostics name the dependent table.
+- another connection pool in the app uses the same database file;
+- `OUTPUT` points at the database or one of its `-wal`/`-shm`/`-journal` files.
 
-### Drizzle workflow
+A migration that opens its own connection to the original database is not redirected, and it can change that
+database. The task notices afterwards (`PRAGMA data_version`) and fails without writing a capture. A
+`wal_checkpoint(TRUNCATE)` from another process, which Litestream runs, trips the same check; run the task again.
 
-Scan the generated SQLite migration SQL and include the earlier object creation
-statements in the same input when checking a rebuild sequence. A finding is
-intentionally based only on object lifecycle evidence visible in that combined
-input.
+Without Rails, run `ruby sqlite_doctor_capture.rb DATABASE MIGRATIONS_DIR OUTPUT` with the `activerecord` and
+`sqlite3` gems installed. The capture code is tested on ActiveRecord 7.1, 7.2 and 8.1.
 
-## Scanner scope and limitations
+## Drizzle
 
-The scanner is a dependency-free lexical scanner for one SQLite SQL input, not
-a generic SQL parser or a migration executor. It sees only its input: a
-transaction, pragma or existing schema object that an ORM or framework adds at
-runtime is invisible unless it is captured into that input, as the Rails
-capture task does. Comments and
-literals are ignored and SQLite trigger bodies are kept together, but malformed
-or non-SQLite dialect input is outside its scope.
+Drizzle's migrator wraps each generated file in a transaction, so the file alone hides the problem: its
+`PRAGMA foreign_keys=OFF` looks effective. Scan an input that matches what runs:
 
-A reported rebuild is a structural pattern anchor: create/copy/drop/rename, or
-the create/copy/drop/recreate/copy-back sequence ActiveRecord emits. It
-is useful evidence for later diagnostics, not proof by itself that the sequence
-is unsafe. `ON DELETE` reference evidence is derived from `CREATE TABLE` statements
-in the same input; the scanner does not currently model a dependent table being
-dropped or having its foreign key removed before a later parent rebuild.
+1. The existing schema: `CREATE TABLE`, `CREATE INDEX` and `CREATE TRIGGER` statements.
+2. `PRAGMA foreign_keys = ON;` (better-sqlite3 turns foreign keys on by default).
+3. `BEGIN;`, the generated migration SQL, `COMMIT;`
 
-`SQLD003` is likewise evidence-bound: it only tracks indexes and triggers that
-are explicitly created in the same input before the matched rebuild. Objects
-from an existing database or earlier migration files are intentionally
-invisible, so their omission cannot be diagnosed. Restoration matches object
-kind and normalized name; recreating an equivalent object under a different
-name still reports the original as missing. The removed-column exception needs
-plain key columns and a replacement CREATE TABLE with a readable column list;
-expression keys and other cases keep reporting. A column renamed by a rebuild
-counts as removed, so a lost index on the old name is not reported. SQLite does not automatically drop
-views with `DROP TABLE`, so views are not reported as missing restoration by
-this rule.
+## How well it works
 
-## Local checks
+On 144 Rails 8.1.4 test cases, `SQLD001` and `SQLD003` reported all 48 that lost rows, foreign-key values or
+triggers, and none of the 96 that kept everything. `SQLD002` fires on every Rails rebuild, so it is not counted
+as a loss warning. The cases are 16 migration operations, each run with 9 setups:
+
+- no dependents
+- a child table with `CASCADE`, `SET NULL` or `RESTRICT`
+- a two-level cascade
+- a trigger, an index or a view on the parent
+- a parent that is itself a cascading child
+
+On the same SQL, `atlas migrate lint` (Community Edition 1.3.0) reported its generic `DS102` "Dropping table" on
+all 117 rebuilds, including the 69 that lost nothing, and never named the child table.
+
+On migrations from 60 public Rails apps, replayed on seeded data (2,840 steps), `SQLD001` and `SQLD003` caught 24
+of the 25 steps that lost data and fired on one step that lost nothing. The miss was a `drop_table` inside
+`disable_referential_integrity`, which is not a rebuild.
+
+## Limits
+
+- It is a lexical scanner for one SQLite input. It does not run SQL and does not parse other SQL dialects.
+- It only knows what is in the input. Tables, indexes and triggers from earlier migrations or the live database
+  are invisible unless you include them; the Rails task does that for you.
+- A reference stays known once its `CREATE TABLE` appears. Dropping the child table, or removing its foreign key,
+  before a later parent rebuild does not clear it, so `SQLD001` can still fire.
+- It recognises two rebuild shapes: create, copy, drop, rename (Drizzle, SQLite's documented procedure), and
+  copy out, drop, create again, copy back (Rails). A rebuild is evidence for a finding, not proof of harm.
+- `SQLD003` matches objects by name. Recreating an index under a different name still reports the old one as
+  missing. A plain-column index on a renamed column counts as removed, so its loss is not reported. Views are not checked
+  because `DROP TABLE` does not drop them.
+
+## Background
+
+- [rails/rails#55866](https://github.com/rails/rails/issues/55866) reported the data loss;
+  [#55907](https://github.com/rails/rails/pull/55907) fixed part of it. Rebuilds inside a transaction still lose
+  rows on 8.1.4; [#57128](https://github.com/rails/rails/pull/57128), [#58709](https://github.com/rails/rails/pull/58709)
+  and [#56811](https://github.com/rails/rails/pull/56811) (triggers) are open.
+- [drizzle-team/drizzle-orm#4938](https://github.com/drizzle-team/drizzle-orm/issues/4938) and
+  [#5782](https://github.com/drizzle-team/drizzle-orm/issues/5782) report the same cascade loss in Drizzle.
+- [SQLite foreign keys](https://www.sqlite.org/foreignkeys.html): `PRAGMA foreign_keys` is a no-op inside a
+  transaction.
+
+## Development
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
-cargo run -- --help
+AR_VERSION=8.1.4 ruby contrib/rails/test/capture_test.rb
 ```
