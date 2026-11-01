@@ -5,25 +5,26 @@
 #
 # ActiveRecord::Base is pointed at the copy for the run and restored
 # afterwards. A migration or model that opens its own connection to the
-# original database is not redirected; the capture fails if the original
-# changed while migrating.
+# original database is not redirected; the capture fails if another connection
+# committed to the original while migrating. A relative database path is
+# resolved like ActiveRecord does: against Rails.root when Rails is loaded.
 #
 # Standalone:
 #   ruby sqlite_doctor_capture.rb DATABASE MIGRATIONS_DIR OUTPUT
 # In a Rails app, see sqlite_doctor.rake.
 
 require "active_record"
-require "digest"
 require "sqlite3"
 require "tmpdir"
 
 module SqliteDoctorCapture
   SIDE_FILES = ["", "-wal", "-shm", "-journal"].freeze
+  STAGING_ATTEMPTS = 10
 
   module_function
 
   def capture(config:, migrations_paths:, output:)
-    database = File.expand_path(config.fetch(:database).to_s)
+    database = resolve_database_path(config.fetch(:database).to_s)
     raise ArgumentError, "#{database} does not exist" unless File.file?(database)
     database = File.realpath(database)
     output = File.expand_path(output)
@@ -52,17 +53,20 @@ module SqliteDoctorCapture
         SQL
         foreign_keys = connection.select_value("PRAGMA foreign_keys")
         rows_before = row_counts(connection)
-        fingerprint = fingerprint(database)
 
+        # data_version changes when another connection commits to the file,
+        # and not when WAL frames are checkpointed (except TRUNCATE).
+        watcher = SQLite3::Database.new(database, readonly: true)
+        version = watcher.get_first_value("PRAGMA data_version")
         statements, failures, error = run_migrations(migrations_paths)
         rows_after = row_counts(base_connection)
-        if fingerprint(database) != fingerprint
-          raise "#{database} changed while migrating the copy: a migration or model " \
-                "opened its own connection to it"
+        if watcher.get_first_value("PRAGMA data_version") != version
+          raise "#{database} changed while migrating the copy: a migration, model or " \
+                "other process committed to it (or ran a TRUNCATE checkpoint)"
         end
       ensure
-        ActiveRecord::Base.connection_pool.disconnect!
-        ActiveRecord::Base.establish_connection(previous_config) if previous_config
+        watcher&.close
+        restore_connection(previous_config)
       end
 
       shrunk = rows_before.filter_map do |table, before|
@@ -100,6 +104,24 @@ module SqliteDoctorCapture
     end
   end
 
+  def restore_connection(previous_config)
+    begin
+      ActiveRecord::Base.connection_pool.disconnect!
+    rescue ActiveRecord::ConnectionNotEstablished
+      nil
+    end
+    if previous_config
+      ActiveRecord::Base.establish_connection(previous_config)
+    else
+      ActiveRecord::Base.remove_connection
+    end
+  end
+
+  def resolve_database_path(path)
+    root = defined?(Rails) && Rails.respond_to?(:root) && Rails.root
+    File.expand_path(path, root || Dir.pwd)
+  end
+
   def current_db_config
     ActiveRecord::Base.connection_db_config
   rescue ActiveRecord::ConnectionNotEstablished
@@ -132,21 +154,16 @@ module SqliteDoctorCapture
 
   def reject_other_pools(database)
     base_pool = current_db_config && ActiveRecord::Base.connection_pool
-    ActiveRecord::Base.connection_handler.connection_pool_list.each do |pool|
+    ActiveRecord::Base.connection_handler.connection_pool_list(:all).each do |pool|
       next if pool.equal?(base_pool)
 
       path = pool.db_config.database.to_s
-      next if path.empty? || !File.exist?(File.expand_path(path))
-      next unless File.identical?(File.expand_path(path), database)
+      next if path.empty? || path.start_with?(":memory:", "file:")
+
+      path = resolve_database_path(path)
+      next unless File.exist?(path) && File.identical?(path, database)
 
       raise "refusing to migrate: connection pool #{pool.db_config.name} also uses #{database}"
-    end
-  end
-
-  def fingerprint(database)
-    SIDE_FILES.map do |suffix|
-      path = database + suffix
-      File.file?(path) ? Digest::SHA256.file(path).hexdigest : nil
     end
   end
 
@@ -184,10 +201,22 @@ module SqliteDoctorCapture
     sql.sub(/;?\s*\z/, ";")
   end
 
+  # The staging file is created with O_EXCL, so a pre-existing file or
+  # symlink at that name is never followed or truncated.
   def write_atomically(output, content)
-    temporary = "#{output}.#{Process.pid}.tmp"
-    File.write(temporary, content)
-    File.rename(temporary, output)
+    STAGING_ATTEMPTS.times do
+      temporary = "#{output}.#{Process.pid}.#{rand(1 << 32).to_s(16)}.tmp"
+      begin
+        File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o644) do |file|
+          file.write(content)
+        end
+      rescue Errno::EEXIST
+        next
+      end
+      File.rename(temporary, output)
+      return
+    end
+    raise "could not create a staging file next to #{output}"
   end
 end
 

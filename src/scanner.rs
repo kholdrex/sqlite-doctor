@@ -205,6 +205,7 @@ pub fn scan_sql(sql: &str) -> ScanReport {
             })
         {
             let candidate = candidates.remove(index);
+            forget_siblings(&mut candidates, candidate.drop_statement_index);
             report
                 .rebuilds
                 .push(candidate.finish(RebuildKind::Recreate));
@@ -212,7 +213,9 @@ pub fn scan_sql(sql: &str) -> ScanReport {
         }
 
         if let Some((temporary_table, original_table)) = copied_table(statement) {
-            if temporary_table.matches(&original_table) {
+            // Only an exact name is the same table: an unqualified temp table
+            // may shadow `main.t` and hold its rows.
+            if temporary_table == original_table {
                 continue;
             }
             if let Some(candidate) = candidates.iter_mut().rev().find(|candidate| {
@@ -256,6 +259,7 @@ pub fn scan_sql(sql: &str) -> ScanReport {
             })
         {
             let mut candidate = candidates.remove(index);
+            forget_siblings(&mut candidates, candidate.drop_statement_index);
             candidate.replacement_line = statement.line;
             candidate.replacement_statement_index = statement_index;
             report.rebuilds.push(candidate.finish(RebuildKind::Rename));
@@ -934,6 +938,17 @@ fn renamed_table(statement: &Statement) -> Option<(Name, Name)> {
     }
     let (to, end) = parse_name(tokens, index + 2)?;
     (end == tokens.len()).then_some((from, to))
+}
+
+/// Other copies taken before the same DROP describe the same destroyed table;
+/// once one of them completes the rebuild they must not report it again.
+fn forget_siblings(candidates: &mut Vec<RebuildCandidate>, drop_statement_index: usize) {
+    candidates.retain(|candidate| {
+        !matches!(
+            candidate.stage,
+            CandidateStage::Dropped | CandidateStage::Recreated
+        ) || candidate.drop_statement_index != drop_statement_index
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

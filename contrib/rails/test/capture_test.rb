@@ -140,4 +140,45 @@ class CaptureTest < Minitest::Test
     assert_includes sql, "-- failed: CREATE UNIQUE INDEX idx_unique_name ON parents(name)"
     refute_match(/^CREATE UNIQUE INDEX idx_unique_name/, sql)
   end
+
+  def test_never_follows_a_planted_staging_file
+    migration("add_column :parents, :extra, :text")
+    before = original_digest
+    real_open = File.method(:open)
+    planted = []
+    File.singleton_class.send(:define_method, :open) do |path, *args, **kw, &block|
+      if path.to_s.end_with?(".tmp") && planted.empty?
+        planted << path
+        File.symlink(File.expand_path(path.to_s.sub(/[^\/]+\z/, "app.sqlite3")), path)
+      end
+      real_open.call(path, *args, **kw, &block)
+    end
+
+    capture
+    assert_equal before, original_digest
+    assert_equal 1, planted.size
+    assert File.symlink?(planted.first)
+  ensure
+    File.singleton_class.send(:define_method, :open, real_open)
+  end
+
+  def test_a_wal_checkpoint_on_close_is_not_a_change
+    SQLite3::Database.new(@database) { |db| db.execute("PRAGMA journal_mode = WAL") }
+    holder = SQLite3::Database.new(@database)
+    holder.execute("INSERT INTO tenants VALUES (2)")
+    migration("add_column :parents, :extra, :text")
+    SqliteDoctorCapture.singleton_class.prepend(Module.new do
+      define_method(:row_counts) { |connection| holder.close unless holder.closed?; super(connection) }
+    end)
+
+    assert_nil capture[:error]
+  end
+
+  def test_leaves_activerecord_unconnected_when_it_started_unconnected
+    ActiveRecord::Base.remove_connection
+    migration("add_column :parents, :extra, :text")
+    capture
+
+    assert_raises(ActiveRecord::ConnectionNotEstablished) { ActiveRecord::Base.connection_db_config }
+  end
 end

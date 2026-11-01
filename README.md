@@ -99,9 +99,11 @@ statement, including transaction boundaries. Statements that failed are kept
 as comments so they never count as restoring an object, and tables that lost
 rows on the copy are listed in the header. It refuses to start when another
 connection pool uses the same database file or when `OUTPUT` would overwrite
-it, and it fails without writing a capture if the original file changed during
-the run, which happens only when a migration opens its own connection to it.
-The application's connection is restored afterwards. Outside Rails, run
+it, and it fails without writing a capture if another connection committed to
+the original during the run (`PRAGMA data_version`), for example a migration
+that opens its own connection to it. A `wal_checkpoint(TRUNCATE)` by another
+process, as Litestream runs, also trips this check; rerun the task. The
+application's connection is restored afterwards. Outside Rails, run
 `ruby sqlite_doctor_capture.rb DATABASE MIGRATIONS_DIR OUTPUT` with
 `activerecord` and `sqlite3` available.
 

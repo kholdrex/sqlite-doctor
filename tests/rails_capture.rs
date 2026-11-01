@@ -171,3 +171,19 @@ fn copying_a_table_into_itself_is_not_a_rebuild() {
     assert!(scan_sql(sql).rebuilds.is_empty());
     assert!(codes(sql).is_empty());
 }
+
+#[test]
+fn a_temp_table_shadowing_the_original_can_hold_its_rows() {
+    let sql = include_str!("fixtures/temp_table_shadows_original.sql");
+
+    assert_eq!(scan_sql(sql).rebuilds.len(), 1);
+    assert_eq!(codes(sql), vec![("SQLD001", 9), ("SQLD003", 9)]);
+}
+
+#[test]
+fn two_holding_copies_of_one_dropped_table_report_one_rebuild() {
+    let sql = include_str!("fixtures/two_holding_copies_one_rebuild.sql");
+
+    assert_eq!(scan_sql(sql).rebuilds.len(), 1);
+    assert_eq!(codes(sql), vec![("SQLD001", 11), ("SQLD003", 11)]);
+}
