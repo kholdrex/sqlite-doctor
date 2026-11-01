@@ -202,3 +202,10 @@ fn a_qualified_self_copy_is_not_a_rebuild() {
     assert!(scan_sql(sql).rebuilds.is_empty());
     assert!(codes(sql).is_empty());
 }
+
+#[test]
+fn a_renamed_temp_table_still_shadows_main() {
+    let sql = include_str!("fixtures/renamed_temp_table_is_rebuilt.sql");
+
+    assert_eq!(codes(sql), vec![("SQLD001", 10), ("SQLD003", 10)]);
+}

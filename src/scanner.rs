@@ -662,7 +662,7 @@ struct TempTables {
 
 impl TempTables {
     /// Updates the set for the statement. Called before the statement's own
-    /// copy is resolved; only CREATE and DROP change it.
+    /// copy is resolved; only CREATE, DROP and RENAME change it.
     fn apply(&mut self, statement: &Statement) {
         let tokens = &statement.tokens;
         if let Some((name, _)) = created_table(statement) {
@@ -676,6 +676,11 @@ impl TempTables {
             && self.resolve(&name).0 == "temp"
         {
             self.names.retain(|leaf| leaf != name.leaf());
+        } else if let Some((from, to)) = renamed_table(statement)
+            && self.resolve(&from).0 == "temp"
+        {
+            self.names.retain(|leaf| leaf != from.leaf());
+            self.names.push(to.leaf().to_string());
         }
     }
 
