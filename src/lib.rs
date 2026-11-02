@@ -87,6 +87,7 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
         for reference in &report.delete_action_references {
             if reference.statement_index < rebuild.drop_statement_index
                 && rebuild.foreign_keys_enabled_at_drop != Some(false)
+                && !dependent_dropped_before(report, reference, rebuild)
                 && name_parts_match(
                     &reference.referenced_table_parts,
                     &rebuild.original_table_parts,
@@ -222,6 +223,30 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
 
     findings.sort_by_key(|finding| finding.line);
     findings
+}
+
+/// A rename involving the child's name keeps the reference: the drop may then
+/// hit a different table.
+fn dependent_dropped_before(
+    report: &ScanReport,
+    reference: &DeleteActionReference,
+    rebuild: &RebuildSequence,
+) -> bool {
+    let window =
+        |index: usize| index > reference.statement_index && index < rebuild.drop_statement_index;
+    let renamed = report.renamed_tables.iter().any(|rename| {
+        window(rename.statement_index)
+            && (rename.from == reference.dependent_identity
+                || rename.to == reference.dependent_identity)
+    });
+    !renamed
+        && report.dropped_tables.iter().any(|dropped| {
+            window(dropped.statement_index)
+                && dropped
+                    .undone_at
+                    .is_none_or(|undone| undone > rebuild.drop_statement_index)
+                && dropped.table == reference.dependent_identity
+        })
 }
 
 fn effective_table_parts<'a>(
