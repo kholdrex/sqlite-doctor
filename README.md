@@ -111,8 +111,10 @@ of the 25 steps that lost data and fired on one step that lost nothing. The miss
 - It is a lexical scanner for one SQLite input. It does not run SQL and does not parse other SQL dialects.
 - It only knows what is in the input. Tables, indexes and triggers from earlier migrations or the live database
   are invisible unless you include them; the Rails task does that for you.
-- A reference stays known once its `CREATE TABLE` appears. Dropping the child table, or removing its foreign key,
-  before a later parent rebuild does not clear it, so `SQLD001` can still fire.
+- A reference counts from its `CREATE TABLE` until the input drops that child table. Rebuilding the child without
+  the foreign key clears it the same way. A drop that a `ROLLBACK` undoes before the parent rebuild doesn't. When it
+  can't tell whether a drop removed the child (a temp table with the same name, a savepoint name it can't read), it
+  keeps warning.
 - It recognises two rebuild shapes: create, copy, drop, rename (Drizzle, SQLite's documented procedure), and
   copy out, drop, create again, copy back (Rails). A rebuild is evidence for a finding, not proof of harm.
 - `SQLD003` matches objects by name. Recreating an index under a different name still reports the old one as

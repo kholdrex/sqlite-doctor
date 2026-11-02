@@ -87,6 +87,7 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
         for reference in &report.delete_action_references {
             if reference.statement_index < rebuild.drop_statement_index
                 && rebuild.foreign_keys_enabled_at_drop != Some(false)
+                && !dependent_dropped_before(report, reference, rebuild)
                 && name_parts_match(
                     &reference.referenced_table_parts,
                     &rebuild.original_table_parts,
@@ -222,6 +223,32 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
 
     findings.sort_by_key(|finding| finding.line);
     findings
+}
+
+/// The dependent table was dropped after the reference was declared and before
+/// the parent's drop, and no rollback undid that drop in between. A table
+/// created again later declares its references anew. A rename of that table in
+/// the same window keeps the reference, since the drop may hit another table.
+fn dependent_dropped_before(
+    report: &ScanReport,
+    reference: &DeleteActionReference,
+    rebuild: &RebuildSequence,
+) -> bool {
+    let window =
+        |index: usize| index > reference.statement_index && index < rebuild.drop_statement_index;
+    let renamed = report.renamed_tables.iter().any(|rename| {
+        window(rename.statement_index)
+            && (rename.from == reference.dependent_identity
+                || rename.to == reference.dependent_identity)
+    });
+    !renamed
+        && report.dropped_tables.iter().any(|dropped| {
+            window(dropped.statement_index)
+                && dropped
+                    .undone_at
+                    .is_none_or(|undone| undone > rebuild.drop_statement_index)
+                && dropped.table == reference.dependent_identity
+        })
 }
 
 fn effective_table_parts<'a>(

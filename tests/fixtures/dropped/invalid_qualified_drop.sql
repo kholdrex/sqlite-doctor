@@ -1,0 +1,10 @@
+PRAGMA foreign_keys=ON;
+CREATE TABLE accounts(id INTEGER PRIMARY KEY);
+INSERT INTO accounts VALUES (1);
+CREATE TABLE orders(account_id REFERENCES accounts(id) ON DELETE CASCADE);
+INSERT INTO orders VALUES (1);
+DROP TABLE main.extra.orders;
+CREATE TABLE __new_accounts(id INTEGER PRIMARY KEY);
+INSERT INTO __new_accounts SELECT id FROM accounts;
+DROP TABLE accounts;
+ALTER TABLE __new_accounts RENAME TO accounts;

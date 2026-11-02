@@ -116,7 +116,28 @@ pub struct DeleteActionReference {
     /// One-based source line containing the reference.
     pub line: usize,
     pub(crate) statement_index: usize,
+    /// Schema and table of the dependent table, resolved like a drop.
+    pub(crate) dependent_identity: (String, String),
     pub(crate) referenced_table_parts: Vec<String>,
+}
+
+/// A `DROP TABLE`, and the statement that undid it if a `ROLLBACK` or
+/// `ROLLBACK TO` an earlier savepoint did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DroppedTable {
+    pub(crate) statement_index: usize,
+    /// Schema and table the drop resolves to, as SQLite resolves it: an
+    /// unqualified name means the temp table of that name if one exists.
+    pub(crate) table: (String, String),
+    pub(crate) undone_at: Option<usize>,
+}
+
+/// An `ALTER TABLE ... RENAME TO`, resolved like a drop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenamedTable {
+    pub(crate) statement_index: usize,
+    pub(crate) from: (String, String),
+    pub(crate) to: (String, String),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -126,6 +147,8 @@ pub struct ScanReport {
     pub delete_action_references: Vec<DeleteActionReference>,
     pub schema_objects: Vec<SchemaObject>,
     pub dropped_schema_objects: Vec<DroppedSchemaObject>,
+    pub(crate) dropped_tables: Vec<DroppedTable>,
+    pub(crate) renamed_tables: Vec<RenamedTable>,
 }
 
 /// Scans one SQLite SQL input for transaction-scoped foreign-key pragmas,
@@ -140,8 +163,49 @@ pub fn scan_sql(sql: &str) -> ScanReport {
     let mut transaction = TransactionState::default();
     let mut foreign_keys_enabled = None;
     let mut foreign_key_states = Vec::with_capacity(statements.len());
+    let mut drops = DropJournal::default();
+    let mut temps = TempTables::default();
+    let mut temp_leaves = std::collections::HashSet::new();
+    let mut unreadable_temp = false;
 
     for (statement_index, statement) in statements.iter().enumerate() {
+        if let Some(name) = exact_dropped_table(statement) {
+            // Rollbacks can bring a temp shadow back without the scanner
+            // seeing it, so an unqualified name once used by a temp table
+            // never resolves to main here.
+            let table = if name.parts.len() == 1
+                && (unreadable_temp || temp_leaves.contains(name.leaf()))
+            {
+                ("temp".to_string(), name.leaf().to_string())
+            } else {
+                owned(temps.resolve(&name))
+            };
+            let drop = DroppedTable {
+                statement_index,
+                table,
+                undone_at: None,
+            };
+            drops.record_drop(&mut report.dropped_tables, drop);
+        } else if let Some((from, to)) = renamed_table(statement) {
+            let from = owned(temps.resolve(&from));
+            let to = (from.0.clone(), to.leaf().to_string());
+            report.renamed_tables.push(RenamedTable {
+                statement_index,
+                from,
+                to,
+            });
+        } else {
+            drops.observe(statement, statement_index, &mut report.dropped_tables);
+        }
+        temps.apply(statement);
+        temp_leaves.extend(temps.names.iter().cloned());
+        let tokens = &statement.tokens;
+        if token_is(tokens, 0, "CREATE")
+            && (token_is(tokens, 1, "TEMP") || token_is(tokens, 1, "TEMPORARY"))
+            && created_table(statement).is_none()
+        {
+            unreadable_temp = true;
+        }
         if let Some(schema_object) = created_schema_object(statement, statement_index) {
             report.schema_objects.push(schema_object);
         }
@@ -553,6 +617,122 @@ fn identifier(token: &Token) -> Option<String> {
     }
 }
 
+/// Follows which `DROP TABLE`s a later `ROLLBACK` undoes. A drop stays in
+/// effect unless the whole transaction rolls back, or the input rolls back
+/// to a savepoint that was set before the drop. Anything it cannot read
+/// (a malformed ROLLBACK, an unreadable savepoint name) counts as undoing the
+/// open drops, so the reference keeps being reported.
+#[derive(Debug, Default)]
+struct DropJournal {
+    /// Indexes into `dropped_tables` of drops made in the open transaction.
+    open: Vec<usize>,
+    /// Open savepoints (name, when readable) and the statement that set each.
+    savepoints: Vec<(Option<Name>, usize)>,
+    in_transaction: bool,
+    explicit: bool,
+}
+
+impl DropJournal {
+    fn record_drop(&mut self, dropped: &mut Vec<DroppedTable>, drop: DroppedTable) {
+        dropped.push(drop);
+        if self.in_transaction {
+            self.open.push(dropped.len() - 1);
+        }
+    }
+
+    fn observe(&mut self, statement: &Statement, index: usize, dropped: &mut [DroppedTable]) {
+        let tokens = &statement.tokens;
+        let ends_at = |at: usize| at == tokens.len();
+        let skip = |at: usize, word: &str| at + usize::from(token_is(tokens, at, word));
+        if token_is(tokens, 0, "BEGIN") {
+            // Any BEGIN opens the journal, even one it cannot fully read: if
+            // SQLite rejected it, a later ROLLBACK only keeps a reference.
+            if !self.in_transaction {
+                self.in_transaction = true;
+                self.explicit = true;
+            }
+        } else if token_is(tokens, 0, "SAVEPOINT") {
+            let name = parse_name(tokens, 1).filter(|(_, end)| ends_at(*end));
+            if name.is_some() || tokens.len() == 2 {
+                if !self.in_transaction {
+                    self.in_transaction = true;
+                    self.explicit = false;
+                }
+                self.savepoints.push((name.map(|(name, _)| name), index));
+            }
+        } else if token_is(tokens, 0, "COMMIT") || token_is(tokens, 0, "END") {
+            if ends_at(skip(1, "TRANSACTION")) {
+                self.close();
+            }
+        } else if token_is(tokens, 0, "ROLLBACK") {
+            let at = skip(1, "TRANSACTION");
+            if ends_at(at) {
+                self.undo_open(dropped, index, None);
+                self.close();
+            } else if token_is(tokens, at, "TO") {
+                let target = parse_name(tokens, skip(at + 1, "SAVEPOINT"))
+                    .filter(|(_, end)| ends_at(*end))
+                    .and_then(|(name, _)| {
+                        self.savepoints.iter().rposition(|(saved, _)| {
+                            saved.as_ref().is_some_and(|saved| saved.matches(&name))
+                        })
+                    });
+                match target.filter(|&position| self.unambiguous_from(position)) {
+                    Some(position) => {
+                        let since = self.savepoints[position].1;
+                        self.savepoints.truncate(position + 1);
+                        self.undo_open(dropped, index, Some(since));
+                    }
+                    None => self.undo_open(dropped, index, None),
+                }
+            } else {
+                self.undo_open(dropped, index, None);
+            }
+        } else if token_is(tokens, 0, "RELEASE") {
+            let name = parse_name(tokens, skip(1, "SAVEPOINT")).filter(|(_, end)| ends_at(*end));
+            let position = name.and_then(|(name, _)| {
+                self.savepoints.iter().rposition(|(saved, _)| {
+                    saved.as_ref().is_some_and(|saved| saved.matches(&name))
+                })
+            });
+            if position.is_some_and(|position| !self.unambiguous_from(position)) {
+                self.undo_open(dropped, index, None);
+            } else if let Some(position) = position {
+                self.savepoints.truncate(position);
+                if self.savepoints.is_empty() && !self.explicit {
+                    self.close();
+                }
+            }
+        }
+    }
+
+    /// No savepoint with an unreadable name sits above `position`, so a
+    /// RELEASE or ROLLBACK TO naming `position` cannot mean a nearer one.
+    fn unambiguous_from(&self, position: usize) -> bool {
+        self.savepoints[position + 1..]
+            .iter()
+            .all(|(name, _)| name.is_some())
+    }
+
+    /// Marks open drops made after `since` (all of them for `None`) as undone.
+    fn undo_open(&mut self, dropped: &mut [DroppedTable], index: usize, since: Option<usize>) {
+        self.open.retain(|&drop| {
+            let undone = since.is_none_or(|since| dropped[drop].statement_index > since);
+            if undone {
+                dropped[drop].undone_at = Some(index);
+            }
+            !undone
+        });
+    }
+
+    fn close(&mut self) {
+        self.open.clear();
+        self.savepoints.clear();
+        self.in_transaction = false;
+        self.explicit = false;
+    }
+}
+
 #[derive(Debug, Default)]
 struct TransactionState {
     in_transaction: bool,
@@ -944,6 +1124,7 @@ fn delete_action_references(
                 action,
                 line: tokens[reference_index].line,
                 statement_index,
+                dependent_identity: created_identity(statement, &dependent_table),
                 referenced_table_parts: referenced_table.parts,
             })
         })
@@ -1037,6 +1218,37 @@ fn dropped_table(statement: &Statement) -> Option<Name> {
         2
     };
     parse_name(tokens, index).map(|(name, _)| name)
+}
+
+/// `DROP TABLE [IF EXISTS] name` and nothing else after the name.
+fn exact_dropped_table(statement: &Statement) -> Option<Name> {
+    let tokens = &statement.tokens;
+    if !token_is(tokens, 0, "DROP") || !token_is(tokens, 1, "TABLE") {
+        return None;
+    }
+    let index = if token_is(tokens, 2, "IF") && token_is(tokens, 3, "EXISTS") {
+        4
+    } else {
+        2
+    };
+    let (name, end) = parse_name(tokens, index)?;
+    (end == tokens.len() && name.parts.len() <= 2).then_some(name)
+}
+
+fn owned((schema, table): (&str, &str)) -> (String, String) {
+    (schema.to_string(), table.to_string())
+}
+
+/// Where a CREATE TABLE puts the table: TEMP or `temp.` means temp, another
+/// qualifier names its schema, otherwise main.
+fn created_identity(statement: &Statement, table: &Name) -> (String, String) {
+    let tokens = &statement.tokens;
+    let schema = match table.parts.as_slice() {
+        [schema, _] => schema.clone(),
+        _ if token_is(tokens, 1, "TEMP") || token_is(tokens, 1, "TEMPORARY") => "temp".to_string(),
+        _ => "main".to_string(),
+    };
+    (schema, table.leaf().to_string())
 }
 
 fn renamed_table(statement: &Statement) -> Option<(Name, Name)> {
