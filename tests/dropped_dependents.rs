@@ -88,8 +88,7 @@ fn a_dependent_created_again_declares_its_reference_anew() {
 
 #[test]
 fn a_dependent_rebuilt_with_a_new_cascade_before_the_parent_is_still_reported() {
-    // The pattern that deleted every check in a real app: the migration adds
-    // ON DELETE CASCADE to the child, then rebuilds the parent.
+    // Dropping the old child must not retire the cascade its replacement declares.
     let sql = format!(
         "CREATE TABLE checks (keyword_id INTEGER REFERENCES accounts(id));\n{}{RAILS_REBUILD}",
         "BEGIN;\nCREATE TEMPORARY TABLE achecks (keyword_id INTEGER);\nINSERT INTO achecks SELECT keyword_id FROM checks;\nDROP TABLE checks;\nCREATE TABLE checks (keyword_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE);\nINSERT INTO checks SELECT keyword_id FROM achecks;\nDROP TABLE achecks;\nCOMMIT;\n"

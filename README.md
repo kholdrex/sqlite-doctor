@@ -25,7 +25,7 @@ its child tables, and the migration still reports success.
 
 | Code | Meaning |
 |---|---|
-| `SQLD001` | A table is rebuilt while a table created earlier in the input references it with `ON DELETE CASCADE`, `SET NULL` or `SET DEFAULT`. Reported unless the input turns foreign keys off before the drop. |
+| `SQLD001` | A table is rebuilt while a table created earlier in the input references it with `ON DELETE CASCADE`, `SET NULL` or `SET DEFAULT`. Reported unless the input turns foreign keys off before the drop, or drops that child table first. |
 | `SQLD002` | `PRAGMA foreign_keys` is set inside a transaction, where SQLite ignores it. |
 | `SQLD003` | An index or trigger created on a table before the rebuild is not created again afterwards. |
 
@@ -113,8 +113,8 @@ of the 25 steps that lost data and fired on one step that lost nothing. The miss
   are invisible unless you include them; the Rails task does that for you.
 - A reference counts from its `CREATE TABLE` until the input drops that child table. Rebuilding the child without
   the foreign key clears it the same way. A drop that a `ROLLBACK` undoes before the parent rebuild doesn't. When it
-  can't tell whether a drop removed the child (a temp table with the same name, a savepoint name it can't read), it
-  keeps warning.
+  can't tell whether a drop removed the child (a temp table used that name earlier, a rename in between, a rollback
+  or savepoint name it can't read), it keeps warning.
 - It recognises two rebuild shapes: create, copy, drop, rename (Drizzle, SQLite's documented procedure), and
   copy out, drop, create again, copy back (Rails). A rebuild is evidence for a finding, not proof of harm.
 - `SQLD003` matches objects by name. Recreating an index under a different name still reports the old one as

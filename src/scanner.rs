@@ -116,7 +116,7 @@ pub struct DeleteActionReference {
     /// One-based source line containing the reference.
     pub line: usize,
     pub(crate) statement_index: usize,
-    /// Schema and table of the dependent table, resolved like a drop.
+    /// Schema and table from the CREATE TABLE that declared the reference.
     pub(crate) dependent_identity: (String, String),
     pub(crate) referenced_table_parts: Vec<String>,
 }
@@ -126,8 +126,8 @@ pub struct DeleteActionReference {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DroppedTable {
     pub(crate) statement_index: usize,
-    /// Schema and table the drop resolves to, as SQLite resolves it: an
-    /// unqualified name means the temp table of that name if one exists.
+    /// Schema and table the drop removes. An unqualified name already used by
+    /// a temp table counts as temp, which keeps a main child's reference.
     pub(crate) table: (String, String),
     pub(crate) undone_at: Option<usize>,
 }
@@ -619,9 +619,9 @@ fn identifier(token: &Token) -> Option<String> {
 
 /// Follows which `DROP TABLE`s a later `ROLLBACK` undoes. A drop stays in
 /// effect unless the whole transaction rolls back, or the input rolls back
-/// to a savepoint that was set before the drop. Anything it cannot read
-/// (a malformed ROLLBACK, an unreadable savepoint name) counts as undoing the
-/// open drops, so the reference keeps being reported.
+/// to a savepoint that was set before the drop. A rollback it cannot read
+/// undoes every open drop, and an unreadable savepoint name stops RELEASE or
+/// ROLLBACK TO from resolving past it, so unclear input keeps the reference.
 #[derive(Debug, Default)]
 struct DropJournal {
     /// Indexes into `dropped_tables` of drops made in the open transaction.
@@ -714,7 +714,6 @@ impl DropJournal {
             .all(|(name, _)| name.is_some())
     }
 
-    /// Marks open drops made after `since` (all of them for `None`) as undone.
     fn undo_open(&mut self, dropped: &mut [DroppedTable], index: usize, since: Option<usize>) {
         self.open.retain(|&drop| {
             let undone = since.is_none_or(|since| dropped[drop].statement_index > since);
@@ -1220,7 +1219,7 @@ fn dropped_table(statement: &Statement) -> Option<Name> {
     parse_name(tokens, index).map(|(name, _)| name)
 }
 
-/// `DROP TABLE [IF EXISTS] name` and nothing else after the name.
+/// A malformed drop fails in SQLite, so it must not hide a surviving child.
 fn exact_dropped_table(statement: &Statement) -> Option<Name> {
     let tokens = &statement.tokens;
     if !token_is(tokens, 0, "DROP") || !token_is(tokens, 1, "TABLE") {
@@ -1239,8 +1238,8 @@ fn owned((schema, table): (&str, &str)) -> (String, String) {
     (schema.to_string(), table.to_string())
 }
 
-/// Where a CREATE TABLE puts the table: TEMP or `temp.` means temp, another
-/// qualifier names its schema, otherwise main.
+/// An unqualified CREATE TABLE targets main even when a temp table shadows
+/// the name.
 fn created_identity(statement: &Statement, table: &Name) -> (String, String) {
     let tokens = &statement.tokens;
     let schema = match table.parts.as_slice() {

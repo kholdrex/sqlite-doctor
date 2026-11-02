@@ -225,10 +225,8 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
     findings
 }
 
-/// The dependent table was dropped after the reference was declared and before
-/// the parent's drop, and no rollback undid that drop in between. A table
-/// created again later declares its references anew. A rename of that table in
-/// the same window keeps the reference, since the drop may hit another table.
+/// A rename involving the child's name keeps the reference: the drop may then
+/// hit a different table.
 fn dependent_dropped_before(
     report: &ScanReport,
     reference: &DeleteActionReference,
