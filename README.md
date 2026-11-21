@@ -1,6 +1,7 @@
 # sqlite-doctor
 
-Finds SQLite migrations that quietly delete or change data when an ORM rebuilds a table.
+Checks SQLite migration SQL for table rebuilds that can delete or change dependent rows, or drop indexes and
+triggers.
 
 ```bash
 cargo install --path .        # from a clone; not on crates.io yet
@@ -15,8 +16,8 @@ Add `--format json` for CI, and pass `-` to read from stdin.
 SQLite can't change most column definitions in place, so ORMs rebuild the table: copy the rows out, drop the
 table, create it again, copy the rows back. Dropping the table also fires every `ON DELETE` action that points at
 it. If foreign keys are on, children with `ON DELETE CASCADE` are deleted and children with `ON DELETE SET NULL`
-lose their reference. Turning foreign keys off doesn't help inside a transaction, because SQLite ignores
-`PRAGMA foreign_keys` there.
+lose their reference. Turning foreign keys off doesn't help inside a transaction, because SQLite ignores changes
+to `PRAGMA foreign_keys` there.
 
 Rails 8.1 and Drizzle both hit this. A one-line `change_column_null` or `remove_column` on a parent table can empty
 its child tables, and the migration still reports success.
@@ -26,14 +27,14 @@ its child tables, and the migration still reports success.
 | Code | Meaning |
 |---|---|
 | `SQLD001` | A table is rebuilt while a table created earlier in the input references it with `ON DELETE CASCADE`, `SET NULL` or `SET DEFAULT`. Reported unless the input turns foreign keys off before the drop, or drops that child table first. |
-| `SQLD002` | `PRAGMA foreign_keys` is set inside a transaction, where SQLite ignores it. |
+| `SQLD002` | `PRAGMA foreign_keys` is changed inside a transaction, where SQLite ignores the change. |
 | `SQLD003` | An index or trigger created on a table before the rebuild is not created again afterwards. |
 
 To rebuild a table safely, follow SQLite's order:
 
 1. `PRAGMA foreign_keys = OFF;` before `BEGIN`
 2. `BEGIN;`, then the rebuild
-3. `PRAGMA foreign_key_check;` and fix what it reports
+3. `PRAGMA foreign_key_check;` and `ROLLBACK;` if it reports anything
 4. `COMMIT;`
 5. `PRAGMA foreign_keys = ON;` after `COMMIT`
 
@@ -62,9 +63,9 @@ inside it (which does nothing), and rebuilds the table through a holding copy. S
 3. Run `sqlite-doctor tmp/migration.sql`.
 
 The task points ActiveRecord at a `VACUUM INTO` copy of the primary database and runs your pending migrations
-there. The output holds the current schema, the `foreign_keys` setting and every statement the migrations
-executed. Failed statements are kept as comments. Tables that still exist but have fewer rows at the end are
-listed in the header.
+there. The output holds the current schema, the `foreign_keys` setting and the SQL that ActiveRecord reported
+while the migrations ran. SQL that a migration sends straight to the SQLite driver is not in it. Failed statements
+are kept as comments. Tables that still exist but have fewer rows at the end are listed in the header.
 
 Before migrating, it refuses to start when:
 
@@ -89,9 +90,10 @@ Drizzle's migrator wraps each generated file in a transaction, so the file alone
 
 ## How well it works
 
-On 144 Rails 8.1.4 test cases, `SQLD001` and `SQLD003` reported all 48 that lost rows, foreign-key values or
-triggers, and none of the 96 that kept everything. `SQLD002` fires on every Rails rebuild, so it is not counted
-as a loss warning. The cases are 16 migration operations, each run with 9 setups:
+The rules were developed on 144 Rails 8.1.4 test cases, so the first result is not an independent test. Given
+the starting schema, the `foreign_keys` setting and the executed SQL, `SQLD001` and `SQLD003` flagged all 48 cases
+that lost rows, foreign-key values or triggers, and none of the other 96. `SQLD002` fires on every Rails rebuild,
+so it is not counted as a loss warning. The cases are 16 migration operations, each run with 9 setups:
 
 - no dependents
 - a child table with `CASCADE`, `SET NULL` or `RESTRICT`
@@ -99,11 +101,20 @@ as a loss warning. The cases are 16 migration operations, each run with 9 setups
 - a trigger, an index or a view on the parent
 - a parent that is itself a cascading child
 
-On the same SQL, `atlas migrate lint` (Community Edition 1.3.0) reported its generic `DS102` "Dropping table" on
-all 117 rebuilds, including the 69 that lost nothing, and never named the child table.
+For the same cases, `atlas migrate lint` (Community Edition 1.3.0) received the starting schema and the migration
+SQL without transaction and bookkeeping statements. It reported its generic `DS102` "Dropping table" on 117 cases:
+the 108 rebuilds and 9 table renames. 69 of the 117 lost nothing, and the message never named the child table.
 
-On migrations from 60 public Rails apps, replayed on seeded data (2,840 steps), `SQLD001` and `SQLD003` caught 24
-of the 25 steps that lost data and fired on one step that lost nothing. The miss was a `drop_table` inside
+The held-out test replayed migrations from 60 public Rails apps on seeded data: 2,840 scored steps, 25 of which
+lost data.
+
+| Build | Losses flagged | False alarms |
+|---|---|---|
+| [`2bf86dc`](https://github.com/kholdrex/sqlite-doctor/commit/2bf86dc), run on the held-out steps | 24 of 25 | 30 |
+| [`6250d4c`](https://github.com/kholdrex/sqlite-doctor/commit/6250d4c), changed after that run | 24 of 25 | 1 |
+
+29 of the 30 false alarms were `SQLD003` on an index whose column the migration removed. The rule was changed
+because of them, so the second row is not a held-out result. The miss was a `drop_table` inside
 `disable_referential_integrity`, which is not a rebuild.
 
 ## Limits
@@ -118,8 +129,9 @@ of the 25 steps that lost data and fired on one step that lost nothing. The miss
 - It recognises two rebuild shapes: create, copy, drop, rename (Drizzle, SQLite's documented procedure), and
   copy out, drop, create again, copy back (Rails). A rebuild is evidence for a finding, not proof of harm.
 - `SQLD003` matches objects by name. Recreating an index under a different name still reports the old one as
-  missing. A plain-column index on a renamed column counts as removed, so its loss is not reported. Views are not checked
-  because `DROP TABLE` does not drop them.
+  missing. A `DROP INDEX` or `DROP TRIGGER` that a `ROLLBACK` undoes does not count as removing it. A plain-column
+  index on a renamed column counts as removed, so its loss is not reported. Views are not checked because
+  `DROP TABLE` does not drop them.
 
 ## Background
 
@@ -129,8 +141,8 @@ of the 25 steps that lost data and fired on one step that lost nothing. The miss
   and [#56811](https://github.com/rails/rails/pull/56811) (triggers) are open.
 - [drizzle-team/drizzle-orm#4938](https://github.com/drizzle-team/drizzle-orm/issues/4938) and
   [#5782](https://github.com/drizzle-team/drizzle-orm/issues/5782) report the same cascade loss in Drizzle.
-- [SQLite foreign keys](https://www.sqlite.org/foreignkeys.html): `PRAGMA foreign_keys` is a no-op inside a
-  transaction.
+- [SQLite foreign keys](https://www.sqlite.org/foreignkeys.html): SQLite ignores changes to `PRAGMA foreign_keys`
+  inside a transaction.
 
 ## Development
 
