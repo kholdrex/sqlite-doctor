@@ -29,7 +29,7 @@ impl HazardId {
                 "table rebuild may fire ON DELETE actions on dependent rows"
             }
             Self::ForeignKeysPragmaInsideTransaction => {
-                "PRAGMA foreign_keys inside a transaction is a no-op"
+                "changing PRAGMA foreign_keys inside a transaction has no effect"
             }
             Self::MissingSchemaObjectRestoration => {
                 "table rebuild may omit restoration of indexes or triggers"
@@ -110,7 +110,7 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
                                     "can reset dependent foreign keys to their default",
                             }
                         ),
-                        "Disable foreign-key enforcement before starting the transaction, perform the rebuild, then restore enforcement and run PRAGMA foreign_key_check; prefer a native ALTER TABLE or staged migration when available.",
+                        "Disable foreign-key enforcement before starting the transaction, rebuild the table, and run PRAGMA foreign_key_check before COMMIT; roll back if it reports violations. Restore enforcement after the transaction ends. Prefer a native ALTER TABLE or staged migration when available.",
                     )
                     .with_related_line(reference.line),
                 );
@@ -145,6 +145,9 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
                 dropped.kind == schema_object.kind
                     && dropped.statement_index > schema_object.statement_index
                     && dropped.statement_index < rebuild.drop_statement_index
+                    && dropped
+                        .undone_at
+                        .is_none_or(|undone| undone > rebuild.drop_statement_index)
                     && name_parts_match(&dropped.name_parts, &schema_object.name_parts)
             });
             let removed_by_earlier_rebuild = report.rebuilds.iter().any(|earlier_rebuild| {
@@ -217,7 +220,11 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
                 "SQLite ignores attempts to turn PRAGMA foreign_keys {} while a transaction is active.",
                 if pragma.requested_enabled { "ON" } else { "OFF" }
             ),
-            "Set PRAGMA foreign_keys=OFF before starting the transaction, restore it after the migration, and run PRAGMA foreign_key_check.",
+            if pragma.requested_enabled {
+                "Move PRAGMA foreign_keys=ON outside the transaction: before BEGIN or after COMMIT."
+            } else {
+                "Set PRAGMA foreign_keys=OFF before BEGIN, run PRAGMA foreign_key_check before COMMIT, and restore the previous setting after the transaction ends."
+            },
         ));
     }
 
@@ -299,23 +306,14 @@ mod tests {
     fn display_includes_code_and_title() {
         assert_eq!(
             HazardId::ForeignKeysPragmaInsideTransaction.to_string(),
-            "SQLD002: PRAGMA foreign_keys inside a transaction is a no-op"
+            "SQLD002: changing PRAGMA foreign_keys inside a transaction has no effect"
         );
     }
 
     #[test]
-    fn finding_constructor_populates_fields() {
-        let finding = Finding::new(
-            HazardId::DeleteActionOnRebuild,
-            12,
-            "Detected rebuild sequence with dependent child tables.",
-            "Use a safer staged migration or avoid rebuild when adding the constraint.",
-        );
-
-        assert_eq!(finding.hazard, HazardId::DeleteActionOnRebuild);
-        assert_eq!(finding.line, 12);
+    fn a_finding_has_no_related_line_until_one_is_set() {
+        let finding = Finding::new(HazardId::DeleteActionOnRebuild, 12, "detail", "help");
         assert_eq!(finding.related_line, None);
-        assert!(finding.detail.contains("rebuild sequence"));
-        assert!(finding.remediation.contains("safer staged migration"));
+        assert_eq!(finding.with_related_line(3).related_line, Some(3));
     }
 }

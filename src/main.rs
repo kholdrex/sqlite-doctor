@@ -132,7 +132,10 @@ fn print_json(source: &str, findings: &[Finding]) -> Result<(), String> {
 
 fn print_help() {
     println!("sqlite-doctor [--format human|json] <SQL_FILE|->");
-    println!("SQLite migration safety linter for ORM-generated rebuild hazards");
+    println!(
+        "Checks SQLite migration SQL for table rebuilds that can delete or change dependent rows,"
+    );
+    println!("or drop indexes and triggers.");
     println!();
     println!("Diagnostics:");
     for hazard in initial_hazards() {

@@ -4,8 +4,7 @@
 //! input, classifies a narrow statement vocabulary, tracks lexical transaction
 //! state, and anchors structural table-rebuild patterns. It cannot observe
 //! framework-injected transactions, dynamic SQL, runtime-selected pragmas, or
-//! state carried across inputs. A rebuild match is an anchor, not proof that a
-//! sequence is unsafe.
+//! state carried across inputs.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForeignKeysPragmaInTransaction {
@@ -87,6 +86,8 @@ pub struct DroppedSchemaObject {
     pub line: usize,
     pub(crate) statement_index: usize,
     pub(crate) name_parts: Vec<String>,
+    /// The `ROLLBACK` that undid the drop, if one did.
+    pub(crate) undone_at: Option<usize>,
 }
 
 /// A foreign-key `ON DELETE` action that rewrites dependent rows when the
@@ -160,10 +161,9 @@ pub struct ScanReport {
 pub fn scan_sql(sql: &str) -> ScanReport {
     let statements = statements(sql);
     let mut report = ScanReport::default();
-    let mut transaction = TransactionState::default();
     let mut foreign_keys_enabled = None;
     let mut foreign_key_states = Vec::with_capacity(statements.len());
-    let mut drops = DropJournal::default();
+    let mut journal = TransactionJournal::default();
     let mut temps = TempTables::default();
     let mut temp_leaves = std::collections::HashSet::new();
     let mut unreadable_temp = false;
@@ -180,12 +180,12 @@ pub fn scan_sql(sql: &str) -> ScanReport {
             } else {
                 owned(temps.resolve(&name))
             };
-            let drop = DroppedTable {
+            report.dropped_tables.push(DroppedTable {
                 statement_index,
                 table,
                 undone_at: None,
-            };
-            drops.record_drop(&mut report.dropped_tables, drop);
+            });
+            journal.record(OpenDrop::Table(report.dropped_tables.len() - 1));
         } else if let Some((from, to)) = renamed_table(statement) {
             let from = owned(temps.resolve(&from));
             let to = (from.0.clone(), to.leaf().to_string());
@@ -194,8 +194,8 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 from,
                 to,
             });
-        } else {
-            drops.observe(statement, statement_index, &mut report.dropped_tables);
+        } else if let Some(command) = TransactionCommand::parse(statement) {
+            journal.apply(command, statement_index, &mut report);
         }
         temps.apply(statement);
         temp_leaves.extend(temps.names.iter().cloned());
@@ -211,12 +211,15 @@ pub fn scan_sql(sql: &str) -> ScanReport {
         }
         if let Some(schema_object) = dropped_schema_object(statement, statement_index) {
             report.dropped_schema_objects.push(schema_object);
+            journal.record(OpenDrop::SchemaObject(
+                report.dropped_schema_objects.len() - 1,
+            ));
         }
         report
             .delete_action_references
             .extend(delete_action_references(statement, statement_index));
         if let Some(enabled) = foreign_keys_setting(statement) {
-            if transaction.in_transaction {
+            if journal.in_transaction {
                 report
                     .foreign_keys_pragmas_in_transactions
                     .push(ForeignKeysPragmaInTransaction {
@@ -228,7 +231,6 @@ pub fn scan_sql(sql: &str) -> ScanReport {
             }
         }
         foreign_key_states.push(foreign_keys_enabled);
-        transaction.apply(statement);
     }
 
     let mut candidates = Vec::<RebuildCandidate>::new();
@@ -617,93 +619,151 @@ fn identifier(token: &Token) -> Option<String> {
     }
 }
 
-/// Follows which `DROP TABLE`s a later `ROLLBACK` undoes. A drop stays in
-/// effect unless the whole transaction rolls back, or the input rolls back
-/// to a savepoint that was set before the drop. A rollback it cannot read
-/// undoes every open drop, and an unreadable savepoint name stops RELEASE or
-/// ROLLBACK TO from resolving past it, so unclear input keeps the reference.
+/// A transaction-control statement. The foreign-key pragma check and the drop
+/// journal both read it from here, so they agree on every spelling.
+#[derive(Debug, PartialEq, Eq)]
+enum TransactionCommand {
+    Begin,
+    /// `None` when the name is a string literal, which the scanner does not
+    /// compare with identifiers.
+    Savepoint(Option<Name>),
+    Commit,
+    Rollback,
+    /// `None` when the target cannot be read or tokens follow it.
+    RollbackTo(Option<Name>),
+    Release(Option<Name>),
+}
+
+impl TransactionCommand {
+    fn parse(statement: &Statement) -> Option<Self> {
+        let tokens = &statement.tokens;
+        let ends_at = |at: usize| at == tokens.len();
+        let skip = |at: usize, word: &str| at + usize::from(token_is(tokens, at, word));
+        let last_name = |at: usize| {
+            parse_name(tokens, at)
+                .filter(|(_, end)| ends_at(*end))
+                .map(|(name, _)| name)
+        };
+
+        if token_is(tokens, 0, "BEGIN") {
+            // Any BEGIN counts, even one SQLite would reject: assuming an
+            // open transaction only keeps warnings.
+            Some(Self::Begin)
+        } else if token_is(tokens, 0, "SAVEPOINT") {
+            let name = last_name(1);
+            (name.is_some() || tokens.len() == 2).then_some(Self::Savepoint(name))
+        } else if token_is(tokens, 0, "COMMIT") || token_is(tokens, 0, "END") {
+            ends_at(after_transaction_name(tokens, 1)).then_some(Self::Commit)
+        } else if token_is(tokens, 0, "ROLLBACK") {
+            let at = after_transaction_name(tokens, 1);
+            if ends_at(at) {
+                Some(Self::Rollback)
+            } else if token_is(tokens, at, "TO") {
+                Some(Self::RollbackTo(last_name(skip(at + 1, "SAVEPOINT"))))
+            } else {
+                Some(Self::RollbackTo(None))
+            }
+        } else if token_is(tokens, 0, "RELEASE") {
+            Some(Self::Release(last_name(skip(1, "SAVEPOINT"))))
+        } else {
+            None
+        }
+    }
+}
+
+/// Skips the `TRANSACTION [name]` that COMMIT, END and ROLLBACK accept.
+fn after_transaction_name(tokens: &[Token], at: usize) -> usize {
+    if !token_is(tokens, at, "TRANSACTION") {
+        return at;
+    }
+    match tokens.get(at + 1) {
+        Some(token) if !keyword(token, "TO") && !matches!(token.kind, TokenKind::Symbol(_)) => {
+            at + 2
+        }
+        _ => at + 1,
+    }
+}
+
+/// A drop made in the open transaction, by its position in the report.
+#[derive(Debug, Clone, Copy)]
+enum OpenDrop {
+    Table(usize),
+    SchemaObject(usize),
+}
+
+/// Follows the open transaction and which drops a later `ROLLBACK` undoes. A
+/// drop stays in effect unless the whole transaction rolls back, or the input
+/// rolls back to a savepoint that was set before the drop. A rollback it
+/// cannot read undoes every open drop, and an unreadable savepoint name stops
+/// RELEASE or ROLLBACK TO from resolving past it, so unclear input keeps the
+/// warning.
 #[derive(Debug, Default)]
-struct DropJournal {
-    /// Indexes into `dropped_tables` of drops made in the open transaction.
-    open: Vec<usize>,
+struct TransactionJournal {
+    open: Vec<OpenDrop>,
     /// Open savepoints (name, when readable) and the statement that set each.
     savepoints: Vec<(Option<Name>, usize)>,
     in_transaction: bool,
     explicit: bool,
 }
 
-impl DropJournal {
-    fn record_drop(&mut self, dropped: &mut Vec<DroppedTable>, drop: DroppedTable) {
-        dropped.push(drop);
+impl TransactionJournal {
+    fn record(&mut self, drop: OpenDrop) {
         if self.in_transaction {
-            self.open.push(dropped.len() - 1);
+            self.open.push(drop);
         }
     }
 
-    fn observe(&mut self, statement: &Statement, index: usize, dropped: &mut [DroppedTable]) {
-        let tokens = &statement.tokens;
-        let ends_at = |at: usize| at == tokens.len();
-        let skip = |at: usize, word: &str| at + usize::from(token_is(tokens, at, word));
-        if token_is(tokens, 0, "BEGIN") {
-            // Any BEGIN opens the journal, even one it cannot fully read: if
-            // SQLite rejected it, a later ROLLBACK only keeps a reference.
-            if !self.in_transaction {
-                self.in_transaction = true;
-                self.explicit = true;
+    fn apply(&mut self, command: TransactionCommand, index: usize, report: &mut ScanReport) {
+        match command {
+            TransactionCommand::Begin => {
+                if !self.in_transaction {
+                    self.in_transaction = true;
+                    self.explicit = true;
+                }
             }
-        } else if token_is(tokens, 0, "SAVEPOINT") {
-            let name = parse_name(tokens, 1).filter(|(_, end)| ends_at(*end));
-            if name.is_some() || tokens.len() == 2 {
+            TransactionCommand::Savepoint(name) => {
                 if !self.in_transaction {
                     self.in_transaction = true;
                     self.explicit = false;
                 }
-                self.savepoints.push((name.map(|(name, _)| name), index));
+                self.savepoints.push((name, index));
             }
-        } else if token_is(tokens, 0, "COMMIT") || token_is(tokens, 0, "END") {
-            if ends_at(skip(1, "TRANSACTION")) {
+            TransactionCommand::Commit => self.close(),
+            TransactionCommand::Rollback => {
+                self.undo_open(report, index, None);
                 self.close();
             }
-        } else if token_is(tokens, 0, "ROLLBACK") {
-            let at = skip(1, "TRANSACTION");
-            if ends_at(at) {
-                self.undo_open(dropped, index, None);
-                self.close();
-            } else if token_is(tokens, at, "TO") {
-                let target = parse_name(tokens, skip(at + 1, "SAVEPOINT"))
-                    .filter(|(_, end)| ends_at(*end))
-                    .and_then(|(name, _)| {
-                        self.savepoints.iter().rposition(|(saved, _)| {
-                            saved.as_ref().is_some_and(|saved| saved.matches(&name))
-                        })
-                    });
-                match target.filter(|&position| self.unambiguous_from(position)) {
+            TransactionCommand::RollbackTo(name) => {
+                let target = name
+                    .and_then(|name| self.savepoint(&name))
+                    .filter(|&position| self.unambiguous_from(position));
+                match target {
                     Some(position) => {
                         let since = self.savepoints[position].1;
                         self.savepoints.truncate(position + 1);
-                        self.undo_open(dropped, index, Some(since));
+                        self.undo_open(report, index, Some(since));
                     }
-                    None => self.undo_open(dropped, index, None),
+                    None => self.undo_open(report, index, None),
                 }
-            } else {
-                self.undo_open(dropped, index, None);
             }
-        } else if token_is(tokens, 0, "RELEASE") {
-            let name = parse_name(tokens, skip(1, "SAVEPOINT")).filter(|(_, end)| ends_at(*end));
-            let position = name.and_then(|(name, _)| {
-                self.savepoints.iter().rposition(|(saved, _)| {
-                    saved.as_ref().is_some_and(|saved| saved.matches(&name))
-                })
-            });
-            if position.is_some_and(|position| !self.unambiguous_from(position)) {
-                self.undo_open(dropped, index, None);
-            } else if let Some(position) = position {
-                self.savepoints.truncate(position);
-                if self.savepoints.is_empty() && !self.explicit {
-                    self.close();
+            TransactionCommand::Release(name) => {
+                let position = name.and_then(|name| self.savepoint(&name));
+                if position.is_some_and(|position| !self.unambiguous_from(position)) {
+                    self.undo_open(report, index, None);
+                } else if let Some(position) = position {
+                    self.savepoints.truncate(position);
+                    if self.savepoints.is_empty() && !self.explicit {
+                        self.close();
+                    }
                 }
             }
         }
+    }
+
+    fn savepoint(&self, name: &Name) -> Option<usize> {
+        self.savepoints
+            .iter()
+            .rposition(|(saved, _)| saved.as_ref().is_some_and(|saved| saved.matches(name)))
     }
 
     /// No savepoint with an unreadable name sits above `position`, so a
@@ -714,11 +774,21 @@ impl DropJournal {
             .all(|(name, _)| name.is_some())
     }
 
-    fn undo_open(&mut self, dropped: &mut [DroppedTable], index: usize, since: Option<usize>) {
-        self.open.retain(|&drop| {
-            let undone = since.is_none_or(|since| dropped[drop].statement_index > since);
+    fn undo_open(&mut self, report: &mut ScanReport, index: usize, since: Option<usize>) {
+        self.open.retain(|drop| {
+            let (dropped_at, undone_at) = match *drop {
+                OpenDrop::Table(position) => {
+                    let table = &mut report.dropped_tables[position];
+                    (table.statement_index, &mut table.undone_at)
+                }
+                OpenDrop::SchemaObject(position) => {
+                    let object = &mut report.dropped_schema_objects[position];
+                    (object.statement_index, &mut object.undone_at)
+                }
+            };
+            let undone = since.is_none_or(|since| dropped_at > since);
             if undone {
-                dropped[drop].undone_at = Some(index);
+                *undone_at = Some(index);
             }
             !undone
         });
@@ -729,76 +799,6 @@ impl DropJournal {
         self.savepoints.clear();
         self.in_transaction = false;
         self.explicit = false;
-    }
-}
-
-#[derive(Debug, Default)]
-struct TransactionState {
-    in_transaction: bool,
-    explicit: bool,
-    savepoints: Vec<Name>,
-}
-
-impl TransactionState {
-    fn apply(&mut self, statement: &Statement) {
-        let tokens = &statement.tokens;
-        if token_is(tokens, 0, "BEGIN") {
-            if !self.in_transaction {
-                self.in_transaction = true;
-                self.explicit = true;
-            }
-        } else if token_is(tokens, 0, "SAVEPOINT") {
-            if let Some((name, _)) = parse_name(tokens, 1) {
-                if !self.in_transaction {
-                    self.in_transaction = true;
-                    self.explicit = false;
-                }
-                self.savepoints.push(name);
-            }
-        } else if token_is(tokens, 0, "COMMIT") || token_is(tokens, 0, "END") {
-            self.clear();
-        } else if token_is(tokens, 0, "ROLLBACK") {
-            if token_is(tokens, 1, "TO") {
-                let name_index = if token_is(tokens, 2, "SAVEPOINT") {
-                    3
-                } else {
-                    2
-                };
-                if let Some((name, _)) = parse_name(tokens, name_index)
-                    && let Some(index) = self
-                        .savepoints
-                        .iter()
-                        .rposition(|candidate| candidate.matches(&name))
-                {
-                    self.savepoints.truncate(index + 1);
-                }
-            } else {
-                self.clear();
-            }
-        } else if token_is(tokens, 0, "RELEASE") {
-            let name_index = if token_is(tokens, 1, "SAVEPOINT") {
-                2
-            } else {
-                1
-            };
-            if let Some((name, _)) = parse_name(tokens, name_index)
-                && let Some(index) = self
-                    .savepoints
-                    .iter()
-                    .rposition(|candidate| candidate.matches(&name))
-            {
-                self.savepoints.truncate(index);
-                if self.savepoints.is_empty() && !self.explicit {
-                    self.clear();
-                }
-            }
-        }
-    }
-
-    fn clear(&mut self) {
-        self.in_transaction = false;
-        self.explicit = false;
-        self.savepoints.clear();
     }
 }
 
@@ -1076,6 +1076,7 @@ fn dropped_schema_object(
         line: statement.line,
         statement_index,
         name_parts: name.parts,
+        undone_at: None,
     })
 }
 

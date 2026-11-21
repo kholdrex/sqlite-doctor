@@ -1,7 +1,7 @@
 # Runs pending ActiveRecord migrations against a copy of a SQLite database and
 # writes one SQL file for `sqlite-doctor`: the baseline schema, the
-# connection's PRAGMA foreign_keys state, and every statement the migrations
-# executed, including transaction boundaries.
+# connection's PRAGMA foreign_keys state, and the SQL ActiveRecord reported
+# while migrating, including transaction boundaries.
 #
 # ActiveRecord::Base is pointed at the copy for the run and restored
 # afterwards. A migration or model that opens its own connection to the
@@ -48,7 +48,7 @@ module SqliteDoctorCapture
 
         schema = connection.select_values(<<~SQL)
           SELECT sql FROM sqlite_schema
-          WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+          WHERE sql IS NOT NULL AND name NOT GLOB 'sqlite_*'
           ORDER BY rowid
         SQL
         foreign_keys = connection.select_value("PRAGMA foreign_keys")
@@ -170,7 +170,7 @@ module SqliteDoctorCapture
   def row_counts(connection)
     tables = connection.select_values(<<~SQL)
       SELECT name FROM sqlite_schema
-      WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+      WHERE type = 'table' AND name NOT GLOB 'sqlite_*'
     SQL
     tables.to_h do |table|
       [table, connection.select_value("SELECT count(*) FROM #{connection.quote_table_name(table)}")]
