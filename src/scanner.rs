@@ -4,8 +4,7 @@
 //! input, classifies a narrow statement vocabulary, tracks lexical transaction
 //! state, and anchors structural table-rebuild patterns. It cannot observe
 //! framework-injected transactions, dynamic SQL, runtime-selected pragmas, or
-//! state carried across inputs. A rebuild match is an anchor, not proof that a
-//! sequence is unsafe.
+//! state carried across inputs.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForeignKeysPragmaInTransaction {

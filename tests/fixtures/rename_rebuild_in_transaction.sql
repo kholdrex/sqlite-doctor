@@ -1,4 +1,4 @@
--- Rails-inspired transaction-wrapped table rebuild.
+-- Create, copy, drop, rename inside a transaction that sets the pragma too late.
 BEGIN TRANSACTION;
 PRAGMA foreign_keys = OFF;
 

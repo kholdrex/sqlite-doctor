@@ -1,12 +1,12 @@
 use sqlite_doctor::scan_sql;
 
-const RAILS_REBUILD: &str = include_str!("fixtures/rails_rebuild.sql");
+const REBUILD_IN_TRANSACTION: &str = include_str!("fixtures/rename_rebuild_in_transaction.sql");
 const DRIZZLE_REBUILD: &str = include_str!("fixtures/drizzle_rebuild.sql");
 const SAFE_FRAGMENTS: &str = include_str!("fixtures/safe_fragments.sql");
 
 #[test]
-fn rails_fixture_detects_transaction_pragma_and_rebuild() {
-    let report = scan_sql(RAILS_REBUILD);
+fn rename_rebuild_in_a_transaction_reports_the_pragma_and_the_rebuild() {
+    let report = scan_sql(REBUILD_IN_TRANSACTION);
 
     assert_eq!(report.foreign_keys_pragmas_in_transactions.len(), 1);
     assert_eq!(report.foreign_keys_pragmas_in_transactions[0].line, 3);

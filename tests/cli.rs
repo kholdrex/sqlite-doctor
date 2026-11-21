@@ -2,6 +2,8 @@ use std::fs;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use serde_json::Value;
+
 static NEXT_TEMPORARY_FILE: AtomicUsize = AtomicUsize::new(0);
 
 const HAZARDOUS_SQL: &str = r#"
@@ -34,13 +36,23 @@ fn json_output_has_a_stable_machine_readable_shape() {
     let output = run_cli(&["--format", "json"], HAZARDOUS_SQL);
     assert_eq!(output.status.code(), Some(1));
 
-    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert!(stdout.contains("\"version\": 1"));
-    assert!(stdout.contains("\"code\": \"SQLD001\""));
-    assert!(stdout.contains("\"code\": \"SQLD002\""));
-    assert!(stdout.contains("\"line\": 9"));
-    assert!(stdout.contains("\"related_line\": 3"));
-    assert!(stdout.contains("\"findings\""));
+    let report = json(&output);
+    assert_eq!(report["version"], 1);
+    let findings = report["findings"].as_array().expect("findings array");
+    assert_eq!(findings.len(), 2);
+
+    assert_eq!(findings[0]["code"], "SQLD002");
+    assert_eq!(findings[0]["line"], 6);
+    assert_eq!(findings[0]["related_line"], Value::Null);
+
+    assert_eq!(findings[1]["code"], "SQLD001");
+    assert_eq!(findings[1]["line"], 9);
+    assert_eq!(findings[1]["related_line"], 3);
+    for finding in findings {
+        for field in ["title", "detail", "remediation"] {
+            assert!(finding[field].is_string(), "{field}");
+        }
+    }
 }
 
 #[test]
@@ -59,11 +71,14 @@ ALTER TABLE __new_users RENAME TO users;
     assert!(stdout.contains("SQLD003"));
     assert!(stdout.contains("idx_users_email"));
 
-    let json = run_cli(&["--format", "json"], sql);
-    assert_eq!(json.status.code(), Some(1));
-    let stdout = String::from_utf8(json.stdout).expect("stdout should be UTF-8");
-    assert!(stdout.contains("\"code\": \"SQLD003\""));
-    assert!(stdout.contains("\"related_line\": 2"));
+    let output = run_cli(&["--format", "json"], sql);
+    assert_eq!(output.status.code(), Some(1));
+    let report = json(&output);
+    let findings = report["findings"].as_array().expect("findings array");
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["code"], "SQLD003");
+    assert_eq!(findings[0]["line"], 5);
+    assert_eq!(findings[0]["related_line"], 2);
 }
 
 #[test]
@@ -95,6 +110,10 @@ fn missing_input_is_a_usage_error() {
 
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("provide a SQL file"));
+}
+
+fn json(output: &Output) -> Value {
+    serde_json::from_slice(&output.stdout).expect("stdout should be JSON")
 }
 
 fn run_cli(extra_arguments: &[&str], sql: &str) -> Output {

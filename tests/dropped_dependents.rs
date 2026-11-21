@@ -6,7 +6,7 @@ DROP TABLE accounts;
 ALTER TABLE __new_accounts RENAME TO accounts;
 ";
 
-const RAILS_REBUILD: &str = "BEGIN;
+const RECREATE_REBUILD: &str = "BEGIN;
 CREATE TEMPORARY TABLE aaccounts (id INTEGER);
 INSERT INTO aaccounts SELECT id FROM accounts;
 DROP TABLE accounts;
@@ -34,7 +34,7 @@ fn a_dropped_dependent_is_not_cascaded_into() {
 #[test]
 fn a_drop_committed_in_an_earlier_migration_retires_the_reference() {
     let sql = format!(
-        "CREATE TABLE orders (account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE);\nBEGIN;\nDROP TABLE orders;\nCOMMIT;\n{RAILS_REBUILD}"
+        "CREATE TABLE orders (account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE);\nBEGIN;\nDROP TABLE orders;\nCOMMIT;\n{RECREATE_REBUILD}"
     );
     assert_eq!(cascade_findings(&sql), 0);
 }
@@ -43,7 +43,7 @@ fn a_drop_committed_in_an_earlier_migration_retires_the_reference() {
 fn a_drop_earlier_in_the_same_transaction_retires_the_reference() {
     let sql = format!(
         "CREATE TABLE orders (account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE);\n{}",
-        RAILS_REBUILD.replacen("BEGIN;\n", "BEGIN;\nDROP TABLE orders;\n", 1)
+        RECREATE_REBUILD.replacen("BEGIN;\n", "BEGIN;\nDROP TABLE orders;\n", 1)
     );
     assert_eq!(cascade_findings(&sql), 0);
 }
@@ -60,7 +60,7 @@ fn a_rolled_back_drop_keeps_the_reference() {
 fn rolling_back_to_a_savepoint_before_the_drop_keeps_the_reference() {
     let sql = format!(
         "CREATE TABLE orders (account_id REFERENCES accounts(id) ON DELETE CASCADE);\nBEGIN;\nSAVEPOINT a;\nDROP TABLE orders;\nROLLBACK TO a;\n{}COMMIT;\n",
-        RAILS_REBUILD
+        RECREATE_REBUILD
             .replace("BEGIN;\n", "")
             .replace("COMMIT;\n", "")
     );
@@ -71,7 +71,7 @@ fn rolling_back_to_a_savepoint_before_the_drop_keeps_the_reference() {
 fn rolling_back_to_a_savepoint_set_after_the_drop_keeps_the_drop() {
     let sql = format!(
         "CREATE TABLE orders (account_id REFERENCES accounts(id) ON DELETE CASCADE);\nBEGIN;\nSAVEPOINT a;\nDROP TABLE orders;\nRELEASE a;\nSAVEPOINT b;\nROLLBACK TO b;\n{}COMMIT;\n",
-        RAILS_REBUILD
+        RECREATE_REBUILD
             .replace("BEGIN;\n", "")
             .replace("COMMIT;\n", "")
     );
@@ -90,7 +90,7 @@ fn a_dependent_created_again_declares_its_reference_anew() {
 fn a_dependent_rebuilt_with_a_new_cascade_before_the_parent_is_still_reported() {
     // Dropping the old child must not retire the cascade its replacement declares.
     let sql = format!(
-        "CREATE TABLE checks (keyword_id INTEGER REFERENCES accounts(id));\n{}{RAILS_REBUILD}",
+        "CREATE TABLE checks (keyword_id INTEGER REFERENCES accounts(id));\n{}{RECREATE_REBUILD}",
         "BEGIN;\nCREATE TEMPORARY TABLE achecks (keyword_id INTEGER);\nINSERT INTO achecks SELECT keyword_id FROM checks;\nDROP TABLE checks;\nCREATE TABLE checks (keyword_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE);\nINSERT INTO checks SELECT keyword_id FROM achecks;\nDROP TABLE achecks;\nCOMMIT;\n"
     );
     assert_eq!(cascade_findings(&sql), 1);
@@ -99,7 +99,7 @@ fn a_dependent_rebuilt_with_a_new_cascade_before_the_parent_is_still_reported() 
 #[test]
 fn a_dependent_rebuilt_without_its_foreign_key_is_no_longer_reported() {
     let sql = format!(
-        "CREATE TABLE orders (account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE);\n{}{RAILS_REBUILD}",
+        "CREATE TABLE orders (account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE);\n{}{RECREATE_REBUILD}",
         "BEGIN;\nCREATE TEMPORARY TABLE aorders (account_id INTEGER);\nINSERT INTO aorders SELECT account_id FROM orders;\nDROP TABLE orders;\nCREATE TABLE orders (account_id INTEGER);\nINSERT INTO orders SELECT account_id FROM aorders;\nDROP TABLE aorders;\nCOMMIT;\n"
     );
     assert_eq!(cascade_findings(&sql), 0);
@@ -147,18 +147,22 @@ fn drops_that_do_not_remove_the_child_keep_the_reference() {
     }
 }
 
-/// More inputs where SQLite still cascades into the child: named and quoted
-/// transactions, temp shadows brought back by a rollback, savepoints whose
-/// names the scanner cannot read.
+/// Named and quoted transactions, temp shadows brought back by a rollback,
+/// and savepoints whose names the scanner cannot read: SQLite still cascades
+/// into the child.
 #[test]
 fn ambiguous_transactions_and_temp_shadows_keep_the_reference() {
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dropped/round2");
-    let mut checked = 0;
-    for entry in std::fs::read_dir(dir).expect("fixture dir") {
-        let path = entry.expect("fixture").path();
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/dropped/ambiguous_transactions_and_temp_shadows"
+    );
+    let fixtures: Vec<_> = std::fs::read_dir(dir)
+        .expect("fixture dir")
+        .map(|entry| entry.expect("fixture").path())
+        .collect();
+    assert!(!fixtures.is_empty());
+    for path in fixtures {
         let sql = std::fs::read_to_string(&path).expect("fixture text");
         assert_eq!(cascade_findings(&sql), 1, "{}", path.display());
-        checked += 1;
     }
-    assert_eq!(checked, 14);
 }
