@@ -33,11 +33,17 @@ COMMIT;
     assert!(cascade.detail.contains("`orders`"));
     assert!(cascade.detail.contains("`accounts`"));
     assert!(cascade.detail.contains("ON DELETE CASCADE"));
+    let remediation = &cascade.remediation;
+    let check = remediation
+        .find("PRAGMA foreign_key_check before COMMIT")
+        .expect("the integrity check belongs inside the transaction");
+    let restore = remediation
+        .find("Restore enforcement after the transaction ends")
+        .expect("enforcement is restored after the transaction");
     assert!(
-        cascade
-            .remediation
-            .contains("before starting the transaction")
+        remediation.starts_with("Disable foreign-key enforcement before starting the transaction")
     );
+    assert!(check < restore);
 }
 
 #[test]
@@ -171,6 +177,8 @@ COMMIT;
         HazardId::ForeignKeysPragmaInsideTransaction
     );
     assert!(findings[0].detail.contains("ON"));
+    assert!(findings[0].remediation.contains("foreign_keys=ON"));
+    assert!(!findings[0].remediation.contains("OFF"));
 }
 
 #[test]
@@ -214,4 +222,14 @@ fn emits_transaction_pragma_finding_from_existing_scanner_evidence() {
         HazardId::ForeignKeysPragmaInsideTransaction
     );
     assert_eq!(findings[0].line, 2);
+    assert!(
+        findings[0]
+            .remediation
+            .starts_with("Set PRAGMA foreign_keys=OFF before BEGIN")
+    );
+    assert!(
+        findings[0]
+            .remediation
+            .contains("PRAGMA foreign_key_check before COMMIT")
+    );
 }
