@@ -80,6 +80,24 @@ class CaptureTest < Minitest::Test
     assert_equal ["children 2 -> 0"], result[:shrunk_tables]
   end
 
+  def test_keeps_tables_whose_names_only_start_with_sqlite
+    SQLite3::Database.new(@database) do |db|
+      db.execute_batch(<<~SQL)
+        CREATE TABLE sqliteX (id INTEGER PRIMARY KEY AUTOINCREMENT,
+          parent_id INTEGER REFERENCES parents(id) ON DELETE CASCADE);
+        INSERT INTO sqliteX (parent_id) VALUES (1);
+      SQL
+    end
+    migration("add_foreign_key :parents, :tenants, column: :tenant_id")
+
+    result = capture
+    sql = File.read(@output)
+
+    assert_includes sql, "CREATE TABLE sqliteX"
+    refute_match(/^CREATE TABLE sqlite_sequence/, sql)
+    assert_includes result[:shrunk_tables], "sqliteX 1 -> 0"
+  end
+
   def test_restores_the_callers_connection
     migration("add_column :parents, :extra, :text")
     capture
