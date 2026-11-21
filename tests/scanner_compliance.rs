@@ -49,6 +49,61 @@ PRAGMA foreign_keys=OFF;
 }
 
 #[test]
+fn every_rollback_to_savepoint_spelling_stays_inside_the_transaction() {
+    for rollback in [
+        "ROLLBACK TO s",
+        "ROLLBACK TO SAVEPOINT s",
+        "ROLLBACK TRANSACTION TO s",
+        "ROLLBACK TRANSACTION TO SAVEPOINT s",
+        "ROLLBACK TRANSACTION migration TO s",
+    ] {
+        let sql = format!(
+            "BEGIN;\nSAVEPOINT s;\n{rollback};\nPRAGMA foreign_keys=OFF;\nCREATE TABLE __new_t(id);\nINSERT INTO __new_t SELECT id FROM t;\nDROP TABLE t;\nALTER TABLE __new_t RENAME TO t;\nCOMMIT;\n"
+        );
+        let report = scan_sql(&sql);
+        let lines: Vec<_> = report
+            .foreign_keys_pragmas_in_transactions
+            .iter()
+            .map(|pragma| pragma.line)
+            .collect();
+        assert_eq!(lines, vec![4], "{rollback}");
+        assert_eq!(
+            report.rebuilds[0].foreign_keys_enabled_at_drop, None,
+            "{rollback}"
+        );
+    }
+}
+
+#[test]
+fn named_transactions_end_like_unnamed_ones() {
+    for end in [
+        "COMMIT TRANSACTION migration",
+        "END TRANSACTION 'migration'",
+        "ROLLBACK TRANSACTION migration",
+    ] {
+        let sql = format!("BEGIN TRANSACTION migration;\n{end};\nPRAGMA foreign_keys=OFF;\n");
+        let report = scan_sql(&sql);
+        assert!(
+            report.foreign_keys_pragmas_in_transactions.is_empty(),
+            "{end}"
+        );
+    }
+}
+
+#[test]
+fn a_rejected_commit_and_a_quoted_savepoint_leave_the_transaction_open() {
+    for opening in ["BEGIN;\nCOMMIT unexpected", "SAVEPOINT 's'"] {
+        let sql = format!("{opening};\nPRAGMA foreign_keys=OFF;\n");
+        let report = scan_sql(&sql);
+        assert_eq!(
+            report.foreign_keys_pragmas_in_transactions.len(),
+            1,
+            "{opening}"
+        );
+    }
+}
+
+#[test]
 fn pragma_assignment_accepts_schema_and_boolean_spellings_but_not_queries() {
     let sql = r#"
 BEGIN;

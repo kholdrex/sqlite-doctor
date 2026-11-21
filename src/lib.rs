@@ -145,6 +145,9 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
                 dropped.kind == schema_object.kind
                     && dropped.statement_index > schema_object.statement_index
                     && dropped.statement_index < rebuild.drop_statement_index
+                    && dropped
+                        .undone_at
+                        .is_none_or(|undone| undone > rebuild.drop_statement_index)
                     && name_parts_match(&dropped.name_parts, &schema_object.name_parts)
             });
             let removed_by_earlier_rebuild = report.rebuilds.iter().any(|earlier_rebuild| {

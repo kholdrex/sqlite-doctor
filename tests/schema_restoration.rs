@@ -59,6 +59,58 @@ fn explicit_object_removal_before_table_drop_is_intentional() {
 }
 
 #[test]
+fn a_rolled_back_object_drop_is_not_a_removal() {
+    for (name, drops) in [
+        (
+            "rollback",
+            "BEGIN;\nDROP INDEX idx_users_email;\nDROP TRIGGER users_audit;\nROLLBACK;",
+        ),
+        (
+            "rollback to a savepoint set before the drops",
+            "BEGIN;\nSAVEPOINT s;\nDROP INDEX idx_users_email;\nDROP TRIGGER users_audit;\nROLLBACK TRANSACTION TO s;\nCOMMIT;",
+        ),
+        (
+            "unreadable rollback target",
+            "SAVEPOINT s;\nDROP INDEX idx_users_email;\nDROP TRIGGER users_audit;\nROLLBACK TO 's';\nRELEASE s;",
+        ),
+    ] {
+        let sql = rebuild(
+            &format!(
+                "CREATE INDEX idx_users_email ON users(email);\nCREATE TRIGGER users_audit AFTER UPDATE ON users BEGIN SELECT 1; END;\n{drops}"
+            ),
+            "",
+        );
+        let missing: Vec<_> = diagnose(&scan_sql(&sql))
+            .into_iter()
+            .filter(|finding| finding.hazard == HazardId::MissingSchemaObjectRestoration)
+            .map(|finding| finding.related_line)
+            .collect();
+        assert_eq!(missing, vec![Some(1), Some(2)], "{name}");
+    }
+}
+
+#[test]
+fn an_object_drop_that_survives_the_transaction_is_a_removal() {
+    for (name, drops) in [
+        ("commit", "BEGIN;\nDROP INDEX idx_users_email;\nCOMMIT;"),
+        (
+            "rollback to a savepoint set after the drop",
+            "BEGIN;\nDROP INDEX idx_users_email;\nSAVEPOINT s;\nROLLBACK TO s;\nCOMMIT;",
+        ),
+        (
+            "released savepoint",
+            "SAVEPOINT s;\nDROP INDEX idx_users_email;\nRELEASE s;",
+        ),
+    ] {
+        let sql = rebuild(
+            &format!("CREATE INDEX idx_users_email ON users(email);\n{drops}"),
+            "",
+        );
+        assert!(diagnose(&scan_sql(&sql)).is_empty(), "{name}");
+    }
+}
+
+#[test]
 fn quoted_names_match_recreation_but_different_names_do_not() {
     let restored = rebuild(
         "CREATE UNIQUE INDEX \"IDX_Email\" ON [users](email);",
