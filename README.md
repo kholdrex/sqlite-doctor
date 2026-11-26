@@ -137,14 +137,19 @@ builds.
   drop the renamed table. The third is the order that SQLite's
   [`ALTER TABLE` page](https://www.sqlite.org/lang_altertable.html) warns against: the rename points the children's
   references at the new name, so the drop fires their `ON DELETE` actions and leaves the references on a table
-  that is gone. The copy is an `INSERT ... SELECT`, with or without a `WITH` clause; `CREATE TABLE ... AS SELECT`
-  is not read as one. A rebuild is evidence for a finding, not proof of harm: one inside a transaction that later
-  rolls back is still reported.
+  that is gone. A rebuild is evidence for a finding, not proof of harm: one inside a transaction that later rolls
+  back is still reported.
+- The copy is an `INSERT ... SELECT`, with or without a `WITH` clause, an `INSERT ... VALUES` that reads a table
+  in a subquery, or a `CREATE TABLE ... AS SELECT`, which creates the table and copies into it in one statement.
+  The tables the rows come from are the names that follow `FROM` and `JOIN`; a table named after a comma in a
+  `FROM` list is not read. A replacement filled only with literal values reads no table, so dropping the original
+  is not reported as a rebuild.
 - `SQLD003` matches objects by schema and name, and an index or trigger stays with its table through a rename.
   Recreating an index under a different name still reports the old one as missing. Recreating it only after the table has been rebuilt again, or in a transaction that rolls back,
   does not count. A `DROP INDEX` or `DROP TRIGGER` that a `ROLLBACK` undoes does not count as removing it. An
   indexed column is followed through `ALTER TABLE ... RENAME COLUMN`; when the rebuild itself renames the column,
-  a plain-column index on it counts as removed, so its loss is not reported. Views are not checked
+  a plain-column index on it counts as removed, so its loss is not reported. `CREATE TABLE ... AS SELECT` lists
+  no columns, so an index is reported even when the query leaves its column out. Views are not checked
   because `DROP TABLE` does not drop them.
 
 ## Background

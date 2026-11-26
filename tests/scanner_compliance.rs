@@ -351,3 +351,125 @@ fn a_with_clause_is_part_of_the_copy_only_in_an_insert() {
         assert!(scan_sql(&sql).rebuilds.is_empty(), "{not_a_copy}");
     }
 }
+
+#[test]
+fn create_table_as_select_is_the_creation_and_the_copy() {
+    for copy in [
+        "CREATE TABLE __new_t AS SELECT id FROM t",
+        "CREATE TABLE IF NOT EXISTS main.__new_t AS SELECT id FROM t",
+        "CREATE TABLE __new_t AS WITH src AS (SELECT id FROM t) SELECT id FROM src",
+        "CREATE TABLE __new_t AS SELECT u.id FROM u JOIN t USING(id)",
+        "CREATE TABLE __new_t AS VALUES((SELECT id FROM t))",
+    ] {
+        let sql = format!("{copy};\nDROP TABLE t;\nALTER TABLE __new_t RENAME TO t;");
+        let report = scan_sql(&sql);
+        assert_eq!(report.rebuilds.len(), 1, "{copy}");
+        let rebuild = &report.rebuilds[0];
+        assert_eq!(rebuild.kind, RebuildKind::Rename, "{copy}");
+        assert_eq!(rebuild.original_table, "t", "{copy}");
+        assert_eq!(
+            (
+                rebuild.create_line,
+                rebuild.copy_line,
+                rebuild.drop_line,
+                rebuild.replacement_line
+            ),
+            (1, 1, 2, 3),
+            "{copy}"
+        );
+    }
+
+    for not_a_copy in [
+        "CREATE TABLE __new_t AS SELECT 1 AS id",
+        "CREATE TABLE __new_t AS VALUES(1)",
+        "CREATE TABLE __new_t(id, CHECK (id IS NOT DISTINCT FROM t))",
+        "CREATE VIEW __new_t AS SELECT id FROM t",
+    ] {
+        let sql = format!("{not_a_copy};\nDROP TABLE t;\nALTER TABLE __new_t RENAME TO t;");
+        assert!(scan_sql(&sql).rebuilds.is_empty(), "{not_a_copy}");
+    }
+}
+
+#[test]
+fn create_table_as_select_can_recreate_the_table_and_copy_back() {
+    let sql = r#"
+CREATE TABLE held AS SELECT id FROM t;
+DROP TABLE t;
+CREATE TABLE t AS SELECT id FROM held;
+DROP TABLE held;
+"#;
+    let report = scan_sql(sql);
+    assert_eq!(report.rebuilds.len(), 1);
+    let rebuild = &report.rebuilds[0];
+    assert_eq!(rebuild.kind, RebuildKind::Recreate);
+    assert_eq!(rebuild.original_table, "t");
+    assert_eq!(rebuild.temporary_table, "held");
+    assert_eq!(
+        (
+            rebuild.create_line,
+            rebuild.copy_line,
+            rebuild.drop_line,
+            rebuild.replacement_line
+        ),
+        (2, 2, 3, 4)
+    );
+
+    let filled_from_another_table = r#"
+CREATE TABLE held AS SELECT id FROM t;
+DROP TABLE t;
+CREATE TABLE t AS SELECT id FROM u;
+"#;
+    assert!(scan_sql(filled_from_another_table).rebuilds.is_empty());
+}
+
+#[test]
+fn create_table_as_select_can_replace_a_table_renamed_away() {
+    let sql = r#"
+ALTER TABLE t RENAME TO t_old;
+CREATE TABLE t AS SELECT id FROM t_old;
+DROP TABLE t_old;
+"#;
+    let report = scan_sql(sql);
+    assert_eq!(report.rebuilds.len(), 1);
+    let rebuild = &report.rebuilds[0];
+    assert_eq!(rebuild.kind, RebuildKind::RenameAway);
+    assert_eq!(rebuild.original_table, "t");
+    assert_eq!(rebuild.dropped_table(), "t_old");
+    assert_eq!(
+        (
+            rebuild.create_line,
+            rebuild.copy_line,
+            rebuild.drop_line,
+            rebuild.replacement_line
+        ),
+        (3, 3, 4, 3)
+    );
+}
+
+#[test]
+fn values_is_a_copy_only_when_it_reads_a_table() {
+    let rebuilds = |copy: &str| {
+        let sql = format!(
+            "CREATE TABLE __new_t(id);\n{copy};\nDROP TABLE t;\nALTER TABLE __new_t RENAME TO t;"
+        );
+        scan_sql(&sql).rebuilds
+    };
+
+    for copy in [
+        "INSERT INTO __new_t VALUES((SELECT id FROM t))",
+        "INSERT OR REPLACE INTO __new_t(id) VALUES((SELECT max(id) FROM t))",
+        "REPLACE INTO __new_t VALUES(1), ((SELECT id FROM t))",
+    ] {
+        let rebuilds = rebuilds(copy);
+        assert_eq!(rebuilds.len(), 1, "{copy}");
+        assert_eq!(rebuilds[0].original_table, "t", "{copy}");
+        assert_eq!(rebuilds[0].copy_line, 2, "{copy}");
+    }
+
+    for not_a_copy in [
+        "INSERT INTO __new_t VALUES(1)",
+        "INSERT INTO __new_t DEFAULT VALUES",
+    ] {
+        assert!(rebuilds(not_a_copy).is_empty(), "{not_a_copy}");
+    }
+}

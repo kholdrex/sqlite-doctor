@@ -321,6 +321,24 @@ pub fn scan_sql(sql: &str) -> ScanReport {
             let table = (!temp_tables.shadowed(&name)).then(|| owned(temp_tables.resolve(&name)));
             (name, table)
         });
+        // CREATE TABLE ... AS SELECT is a creation and a copy in one. Its
+        // query reads the tables that exist before it, and without a schema
+        // it makes a main table even when a temp table has the name.
+        let copy = copied_table(statement).map(|(target, sources)| {
+            let target_table = match created_table(statement) {
+                Some(_) => created_identity(statement, &target),
+                None => owned(temp_tables.resolve(&target)),
+            };
+            // `t` and `main.t` are one table unless a temp `t` shadows it.
+            let sources: Vec<_> = sources
+                .into_iter()
+                .map(|source| {
+                    let elsewhere = owned(temp_tables.resolve(&source)) != target_table;
+                    (source, elsewhere)
+                })
+                .collect();
+            (target, target_table, sources)
+        });
         temp_tables.apply(statement);
         let completed = (statement.line, statement_index);
 
@@ -342,44 +360,48 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 });
             }
 
-            // IF NOT EXISTS does nothing to a replacement that is there.
+            // IF NOT EXISTS does nothing to a replacement that is there. With
+            // AS SELECT the rows still count as copied into it: the scanner
+            // cannot tell whether the table was there.
             let if_not_exists =
                 token_is(&statement.tokens, 2, "IF") || token_is(&statement.tokens, 3, "IF");
-            if if_not_exists
+            let kept = if_not_exists
                 && candidates
                     .iter()
-                    .any(|candidate| candidate.temporary_table.matches(&created))
-            {
+                    .any(|candidate| candidate.temporary_table.matches(&created));
+            if !kept {
+                // A new table with the name of an older, incomplete
+                // replacement supersedes it, unless that one holds the rows
+                // of this table.
+                candidates.retain(|candidate| {
+                    !candidate.temporary_table.matches(&created)
+                        || candidate.sources.iter().any(|source| {
+                            source
+                                .creations
+                                .last()
+                                .is_some_and(|creation| creation.statement_index == statement_index)
+                        })
+                });
+                candidates.push(RebuildCandidate {
+                    schema: created_identity(statement, &created).0,
+                    temporary_table: created,
+                    create_line: statement.line,
+                    create_statement_index: statement_index,
+                    columns,
+                    sources: Vec::new(),
+                });
+            }
+            if copy.is_none() {
                 continue;
             }
-            // A new table with the name of an older, incomplete replacement
-            // supersedes it, unless that one holds the rows of this table.
-            candidates.retain(|candidate| {
-                !candidate.temporary_table.matches(&created)
-                    || candidate.sources.iter().any(|source| {
-                        source
-                            .creations
-                            .last()
-                            .is_some_and(|creation| creation.statement_index == statement_index)
-                    })
-            });
-            candidates.push(RebuildCandidate {
-                schema: created_identity(statement, &created).0,
-                temporary_table: created,
-                create_line: statement.line,
-                create_statement_index: statement_index,
-                columns,
-                sources: Vec::new(),
-            });
-            continue;
         }
 
-        if let Some((target, sources)) = copied_table(statement) {
-            let target_table = temp_tables.resolve(&target);
+        if let Some((target, target_table, sources)) = copy {
+            let target_table = (target_table.0.as_str(), target_table.1.as_str());
             let copied_back = candidates.iter().rev().find_map(|candidate| {
                 if !sources
                     .iter()
-                    .any(|source| candidate.temporary_table.matches(source))
+                    .any(|(source, _)| candidate.temporary_table.matches(source))
                 {
                     return None;
                 }
@@ -402,11 +424,10 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 complete(&mut report, &mut candidates, rebuild);
             }
 
-            // `t` and `main.t` are one table unless a temp `t` shadows it.
             let copies: Vec<_> = sources
                 .into_iter()
-                .filter(|source| temp_tables.resolve(source) != target_table)
-                .map(|table| CopySource {
+                .filter(|(_, elsewhere)| *elsewhere)
+                .map(|(table, _)| CopySource {
                     replaces_only: scratch_table
                         .as_ref()
                         .is_some_and(|scratch| scratch.matches(&table)),
@@ -1361,12 +1382,19 @@ fn table_definition_ranges(tokens: &[Token], opening_parenthesis: usize) -> Vec<
     ranges
 }
 
-/// The table an `INSERT ... SELECT` fills and every table its rows may come
-/// from: the names after FROM and JOIN, also in subqueries and in the queries
-/// of a WITH clause before the INSERT or before its SELECT. The name of such
-/// a query counts as a table too.
+/// The table an `INSERT` or a `CREATE TABLE ... AS` fills from a query, and
+/// every table its rows may come from: the names after FROM and JOIN, also in
+/// subqueries and in the queries of a WITH clause before the INSERT or before
+/// its SELECT. The name of such a query counts as a table too.
 fn copied_table(statement: &Statement) -> Option<(Name, Vec<Name>)> {
     let tokens = &statement.tokens;
+    if let Some((created, index)) = created_table(statement) {
+        if !token_is(tokens, index, "AS") {
+            return None;
+        }
+        let sources = source_tables(tokens, index + 1..tokens.len());
+        return (!sources.is_empty()).then_some((created, sources));
+    }
     if !token_is(tokens, 0, "WITH") {
         return inserted_table(tokens, 0);
     }
@@ -1407,11 +1435,20 @@ fn inserted_table(tokens: &[Token], start: usize) -> Option<(Name, Vec<Name>)> {
     if symbol_is(tokens, index, '(') {
         index = after_balanced_parentheses(tokens, index)?;
     }
-    if !token_is(tokens, index, "SELECT") && !token_is(tokens, index, "WITH") {
+    // VALUES can read a table through a scalar subquery.
+    if !["SELECT", "WITH", "VALUES"]
+        .iter()
+        .any(|keyword| token_is(tokens, index, keyword))
+    {
         return None;
     }
-    let sources: Vec<_> = (0..start)
-        .chain(index + 1..tokens.len())
+    let sources = source_tables(tokens, (0..start).chain(index + 1..tokens.len()));
+    (!sources.is_empty()).then_some((target, sources))
+}
+
+/// The names after FROM and JOIN at the given token positions.
+fn source_tables(tokens: &[Token], positions: impl Iterator<Item = usize>) -> Vec<Name> {
+    positions
         .filter(|position| {
             token_is(tokens, *position, "JOIN")
                 // Not the FROM of `IS [NOT] DISTINCT FROM`.
@@ -1420,8 +1457,7 @@ fn inserted_table(tokens: &[Token], start: usize) -> Option<(Name, Vec<Name>)> {
         })
         .filter_map(|position| parse_name(tokens, position + 1))
         .map(|(source, _)| source)
-        .collect();
-    (!sources.is_empty()).then_some((target, sources))
+        .collect()
 }
 
 fn after_balanced_parentheses(tokens: &[Token], start: usize) -> Option<usize> {
@@ -1640,7 +1676,8 @@ impl RebuildCandidate {
     /// resolved to another schema than `wanted` when a drop in that schema
     /// is known, nor one that found no table: a second drop in the same
     /// schema with no CREATE of the name in between. In the copy-back shape
-    /// the table must have been created again after the drop.
+    /// the table must have been created again after the drop; a CREATE TABLE
+    /// ... AS SELECT that copies back is that creation too.
     fn rebuilds(
         &self,
         report: &ScanReport,
@@ -1664,7 +1701,7 @@ impl RebuildCandidate {
         let created_between = |from: usize, to: usize| {
             sources().any(|source| {
                 source.creations.iter().any(|creation| {
-                    creation.statement_index > from && creation.statement_index < to
+                    creation.statement_index > from && creation.statement_index <= to
                 })
             })
         };
@@ -1715,7 +1752,7 @@ impl RebuildCandidate {
         // ones list other columns, the columns it has are not known.
         let mut creations = source.creations.iter().filter(|creation| {
             creation.statement_index > drop.statement_index
-                && creation.statement_index < completed.1
+                && creation.statement_index <= completed.1
         });
         let (replacement_line, replacement_statement_index, replacement_columns) =
             match creations.next() {
