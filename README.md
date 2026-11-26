@@ -132,9 +132,14 @@ builds.
   in a transaction that rolls back does not count; a drop that a `ROLLBACK` undoes before the parent rebuild does
   not clear it. When it can't tell whether a drop removed the child (a temp table used that name earlier, the
   child was renamed, a rollback names no open savepoint), it keeps warning.
-- It recognises two rebuild shapes: create, copy, drop, rename (Drizzle, SQLite's documented procedure), and
-  copy out, drop, create again, copy back (Rails). A rebuild is evidence for a finding, not proof of harm: one
-  inside a transaction that later rolls back is still reported.
+- It recognises three rebuild shapes: create, copy, drop, rename (Drizzle, SQLite's documented procedure); copy
+  out, drop, create again, copy back (Rails); and rename the table away, create it again under the old name, copy,
+  drop the renamed table. The third is the order that SQLite's
+  [`ALTER TABLE` page](https://www.sqlite.org/lang_altertable.html) warns against: the rename points the children's
+  references at the new name, so the drop fires their `ON DELETE` actions and leaves the references on a table
+  that is gone. The copy is an `INSERT ... SELECT`, with or without a `WITH` clause; `CREATE TABLE ... AS SELECT`
+  is not read as one. A rebuild is evidence for a finding, not proof of harm: one inside a transaction that later
+  rolls back is still reported.
 - `SQLD003` matches objects by schema and name, and an index or trigger stays with its table through a rename.
   Recreating an index under a different name still reports the old one as missing. Recreating it only after the table has been rebuilt again, or in a transaction that rolls back,
   does not count. A `DROP INDEX` or `DROP TRIGGER` that a `ROLLBACK` undoes does not count as removing it. An

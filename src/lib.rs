@@ -98,7 +98,7 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
             };
             if !referenced_tables
                 .iter()
-                .any(|table| name_parts_match(table, &rebuild.original_table_parts))
+                .any(|table| name_parts_match(table, rebuild.dropped_table_parts()))
             {
                 continue;
             }
@@ -133,7 +133,7 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
             if !exists_at(report, schema_object, at)
                 || !tables
                     .iter()
-                    .any(|table| name_parts_match(table, &rebuild.original_table_parts))
+                    .any(|table| name_parts_match(table, rebuild.dropped_table_parts()))
             {
                 continue;
             }
@@ -200,7 +200,7 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
                     rebuild.drop_line,
                     format!(
                         "Dropping `{}` removes {} `{}` from line {}. The input does not recreate it.",
-                        rebuild.original_table,
+                        rebuild.dropped_table(),
                         schema_object.kind.label(),
                         schema_object.name,
                         schema_object.line
@@ -368,15 +368,15 @@ fn exists_at(report: &ScanReport, schema_object: &SchemaObject, at: usize) -> bo
             && table_at(change.statement_index).last() == Some(&change.table.1)
     });
     let lost_in_rebuild = report.rebuilds.iter().any(|rebuild| {
-        let original = &rebuild.original_table_parts;
+        let removed = rebuild.dropped_table_parts();
         rebuild.drop_statement_index > schema_object.statement_index
             && holds_at(
                 rebuild.drop_statement_index,
                 drop_undone_at(report, rebuild),
                 at,
             )
-            && (original.len() == 1 || original[0] == schema_object.identity.0)
-            && name_parts_match(&table_at(rebuild.drop_statement_index), original)
+            && (removed.len() == 1 || removed[0] == schema_object.identity.0)
+            && name_parts_match(&table_at(rebuild.drop_statement_index), removed)
     });
     holds_at(schema_object.statement_index, schema_object.undone_at, at)
         && !dropped

@@ -114,6 +114,32 @@ fn a_renamed_parent_is_matched_by_its_new_name() {
 }
 
 #[test]
+fn a_rename_away_rebuild_is_reported_at_the_drop_of_the_renamed_table() {
+    let sql = fixture("cascade/renamed_away_and_replaced_under_the_old_name.sql");
+    let cascade = &findings(&sql, HazardId::DeleteActionOnRebuild)[0];
+
+    assert_eq!(cascade.line, line_of(&sql, "DROP TABLE accounts_old;"));
+    assert!(
+        cascade
+            .detail
+            .contains("`orders` references rebuilt table `accounts`")
+    );
+}
+
+#[test]
+fn an_index_lost_in_a_rename_away_rebuild_names_the_table_that_is_dropped() {
+    let sql = fixture("lost_index/index_on_a_table_renamed_away.sql");
+    let missing = &findings(&sql, HazardId::MissingSchemaObjectRestoration)[0];
+
+    assert_eq!(missing.line, line_of(&sql, "DROP TABLE users_old;"));
+    assert!(
+        missing
+            .detail
+            .contains("Dropping `users_old` removes index `idx_users_email`")
+    );
+}
+
+#[test]
 fn a_renamed_child_is_reported_by_its_new_name() {
     let sql = fixture("cascade/child_renamed_before_rebuild.sql");
     let cascade = &findings(&sql, HazardId::DeleteActionOnRebuild)[0];
