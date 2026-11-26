@@ -3,22 +3,63 @@ use sqlite_doctor::scan_sql;
 #[test]
 fn trigger_body_is_one_statement_and_cannot_change_outer_state() {
     let sql = r#"
+CREATE TABLE widgets(id INTEGER);
+CREATE TABLE log(message TEXT);
+CREATE TABLE fake(id INTEGER);
+CREATE TABLE __new_fake(id INTEGER);
 BEGIN;
 CREATE TEMP TRIGGER audit AFTER UPDATE ON widgets BEGIN
   INSERT INTO log VALUES (CASE WHEN new.id > 0 THEN 'END; COMMIT;' ELSE 'x' END);
-  CREATE TABLE __new_fake(id);
   INSERT INTO __new_fake SELECT id FROM fake;
-  DROP TABLE fake;
-  ALTER TABLE __new_fake RENAME TO fake;
 END;
 PRAGMA foreign_keys = OFF;
+DROP TRIGGER audit;
+DROP TABLE fake;
+ALTER TABLE __new_fake RENAME TO fake;
 END;
 PRAGMA foreign_keys = OFF;
 "#;
     let report = scan_sql(sql);
+    assert_eq!(report.schema_objects.len(), 1);
     assert_eq!(report.foreign_keys_pragmas_in_transactions.len(), 1);
-    assert_eq!(report.foreign_keys_pragmas_in_transactions[0].line, 10);
+    assert_eq!(report.foreign_keys_pragmas_in_transactions[0].line, 11);
     assert!(report.rebuilds.is_empty());
+}
+
+#[test]
+fn every_insert_conflict_clause_copies_rows_in_both_rebuild_shapes() {
+    for insert in [
+        "INSERT INTO",
+        "INSERT OR ABORT INTO",
+        "INSERT OR FAIL INTO",
+        "INSERT OR IGNORE INTO",
+        "INSERT OR REPLACE INTO",
+        "INSERT OR ROLLBACK INTO",
+        "REPLACE INTO",
+    ] {
+        let rename = format!(
+            "CREATE TABLE __new_t(id);\n{insert} __new_t SELECT id FROM t;\nDROP TABLE t;\nALTER TABLE __new_t RENAME TO t;\n"
+        );
+        let recreate = format!(
+            "CREATE TEMP TABLE held(id);\n{insert} held SELECT id FROM t;\nDROP TABLE t;\nCREATE TABLE t(id INTEGER PRIMARY KEY);\n{insert} t SELECT id FROM held;\n"
+        );
+        assert_eq!(scan_sql(&rename).rebuilds.len(), 1, "{insert}");
+        assert_eq!(scan_sql(&recreate).rebuilds.len(), 1, "{insert}");
+    }
+}
+
+#[test]
+fn a_copy_reads_from_the_table_of_its_own_select() {
+    let sql = r#"
+CREATE TABLE __new_t(id, label);
+INSERT INTO __new_t (id, label)
+  SELECT id, (SELECT label FROM labels WHERE labels.id = t.id) FROM t;
+DROP TABLE t;
+ALTER TABLE __new_t RENAME TO t;
+"#;
+    let report = scan_sql(sql);
+    assert_eq!(report.rebuilds.len(), 1);
+    assert_eq!(report.rebuilds[0].original_table, "t");
 }
 
 #[test]

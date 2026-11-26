@@ -52,7 +52,7 @@ fn supports_table_constraints_qualified_names_and_multiple_rebuilds() {
 CREATE TABLE main.memberships (
   account_id INTEGER,
   team_id INTEGER,
-  FOREIGN KEY (account_id) REFERENCES main.accounts(id) ON DELETE CASCADE,
+  FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
   FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE RESTRICT
 );
 CREATE TABLE audit_events (
@@ -214,7 +214,7 @@ COMMIT;
 }
 
 #[test]
-fn emits_transaction_pragma_finding_from_existing_scanner_evidence() {
+fn in_transaction_pragma_reports_sqld002() {
     let findings = diagnose(&scan_sql("BEGIN;\nPRAGMA foreign_keys=OFF;\nCOMMIT;"));
     assert_eq!(findings.len(), 1);
     assert_eq!(

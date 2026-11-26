@@ -1,7 +1,7 @@
 use sqlite_doctor::scan_sql;
 
 const REBUILD_IN_TRANSACTION: &str = include_str!("fixtures/rename_rebuild_in_transaction.sql");
-const DRIZZLE_REBUILD: &str = include_str!("fixtures/drizzle_rebuild.sql");
+const REBUILD_AFTER_PRAGMA: &str = include_str!("fixtures/rename_rebuild_after_pragma.sql");
 const SAFE_FRAGMENTS: &str = include_str!("fixtures/safe_fragments.sql");
 
 #[test]
@@ -22,8 +22,8 @@ fn rename_rebuild_in_a_transaction_reports_the_pragma_and_the_rebuild() {
 }
 
 #[test]
-fn drizzle_fixture_detects_rebuild_but_not_out_of_scope_pragma() {
-    let report = scan_sql(DRIZZLE_REBUILD);
+fn rename_rebuild_after_the_pragma_reports_the_rebuild_only() {
+    let report = scan_sql(REBUILD_AFTER_PRAGMA);
 
     assert!(report.foreign_keys_pragmas_in_transactions.is_empty());
     assert_eq!(report.rebuilds.len(), 1);

@@ -1,0 +1,11 @@
+-- sqlite3 prints: index=0
+CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT);
+CREATE INDEX idx_users_email ON users('email');
+ALTER TABLE users RENAME TO legacy;
+ALTER TABLE legacy RENAME COLUMN email TO address;
+ALTER TABLE legacy RENAME TO users;
+CREATE TABLE __new_users(id INTEGER PRIMARY KEY, address TEXT);
+INSERT INTO __new_users SELECT id, address FROM users;
+DROP TABLE users;
+ALTER TABLE __new_users RENAME TO users;
+SELECT 'index=' || count(*) FROM main.sqlite_schema WHERE name = 'idx_users_email';

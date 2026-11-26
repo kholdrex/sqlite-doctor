@@ -20,7 +20,7 @@ COMMIT;
 "#;
 
 #[test]
-fn human_output_is_actionable_and_findings_fail_the_check() {
+fn human_output_lists_codes_and_help_and_exits_1() {
     let output = run_cli(&[], HAZARDOUS_SQL);
     assert_eq!(output.status.code(), Some(1));
 
@@ -32,7 +32,7 @@ fn human_output_is_actionable_and_findings_fail_the_check() {
 }
 
 #[test]
-fn json_output_has_a_stable_machine_readable_shape() {
+fn json_output_contains_version_codes_and_lines() {
     let output = run_cli(&["--format", "json"], HAZARDOUS_SQL);
     assert_eq!(output.status.code(), Some(1));
 
@@ -43,7 +43,7 @@ fn json_output_has_a_stable_machine_readable_shape() {
 
     assert_eq!(findings[0]["code"], "SQLD002");
     assert_eq!(findings[0]["line"], 6);
-    assert_eq!(findings[0]["related_line"], Value::Null);
+    assert_eq!(findings[0].get("related_line"), Some(&Value::Null));
 
     assert_eq!(findings[1]["code"], "SQLD001");
     assert_eq!(findings[1]["line"], 9);

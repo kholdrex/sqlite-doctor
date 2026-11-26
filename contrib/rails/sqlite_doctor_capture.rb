@@ -15,11 +15,11 @@
 
 require "active_record"
 require "sqlite3"
+require "tempfile"
 require "tmpdir"
 
 module SqliteDoctorCapture
   SIDE_FILES = ["", "-wal", "-shm", "-journal"].freeze
-  STAGING_ATTEMPTS = 10
 
   module_function
 
@@ -41,6 +41,7 @@ module SqliteDoctorCapture
 
       begin
         ActiveRecord::Base.establish_connection(config.merge(database: copy))
+        copy_pool = ActiveRecord::Base.connection_pool
         connection = base_connection
         unless main_database_path(connection) == File.realpath(copy)
           raise "refusing to migrate: the connection is not attached to the copy"
@@ -58,7 +59,7 @@ module SqliteDoctorCapture
         # and not when WAL frames are checkpointed (except TRUNCATE).
         watcher = SQLite3::Database.new(database, readonly: true)
         version = watcher.get_first_value("PRAGMA data_version")
-        statements, failures, error = run_migrations(migrations_paths)
+        statements, failures, error = run_migrations(migrations_paths, copy_pool)
         rows_after = row_counts(base_connection)
         if watcher.get_first_value("PRAGMA data_version") != version
           raise "#{database} changed while migrating the copy: a migration, model or " \
@@ -79,11 +80,13 @@ module SqliteDoctorCapture
     end
   end
 
-  def run_migrations(migrations_paths)
+  def run_migrations(migrations_paths, copy_pool)
     statements = []
     failures = []
     subscription = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
       next if payload[:cached]
+      # SQL a migration sends to another database is not part of this trace.
+      next unless payload[:connection]&.pool.equal?(copy_pool)
 
       # A failed statement did not change the schema, so it must not count as
       # restoring an object. Keep it visible as a comment.
@@ -157,14 +160,38 @@ module SqliteDoctorCapture
     ActiveRecord::Base.connection_handler.connection_pool_list(:all).each do |pool|
       next if pool.equal?(base_pool)
 
-      path = pool.db_config.database.to_s
-      next if path.empty? || path.start_with?(":memory:", "file:")
-
-      path = resolve_database_path(path)
-      next unless File.exist?(path) && File.identical?(path, database)
+      path = pool_database_path(pool.db_config)
+      next unless path && File.exist?(path) && File.identical?(path, database)
 
       raise "refusing to migrate: connection pool #{pool.db_config.name} also uses #{database}"
     end
+  end
+
+  # The file a pool's database setting names; nil for an in-memory database.
+  def pool_database_path(db_config)
+    path = db_config.database.to_s
+    return nil if path.empty? || path == ":memory:"
+    return resolve_database_path(path) unless path.start_with?("file:")
+
+    location, query = path.delete_prefix("file:").sub(/#.*\z/m, "").split("?", 2)
+    location = location.to_s
+    if location.start_with?("//")
+      authority, location = location[2..].split("/", 2)
+      unless ["", "localhost"].include?(authority.to_s)
+        raise "refusing to migrate: cannot tell which file connection pool " \
+              "#{db_config.name} uses (#{path})"
+      end
+      location = "/#{location}"
+    end
+    unescape = ->(text) { text.gsub(/%(\h\h)/) { Regexp.last_match(1).hex.chr } }
+    location = unescape.call(location)
+    return nil if location.empty? || location == ":memory:"
+    # With more than one mode parameter the file may still be opened.
+    modes = query.to_s.split("&").map(&unescape).select { |parameter| parameter.start_with?("mode=") }
+    return nil if modes == ["mode=memory"]
+
+    # SQLite resolves a relative URI path against the working directory.
+    File.expand_path(location)
   end
 
   def row_counts(connection)
@@ -181,7 +208,7 @@ module SqliteDoctorCapture
     lines = []
     lines << "-- sqlite-doctor capture: ActiveRecord #{ActiveRecord::VERSION::STRING}, " \
              "SQLite #{SQLite3::SQLITE_VERSION}"
-    lines << "-- Migrations ran on a copy of the database; the original was not changed."
+    lines << "-- Migration target: temporary database copy."
     lines << "-- Migration failed: #{error.class}: #{error.message.lines.first&.strip}" if error
     lines << "-- #{failures.size} statement(s) failed and are kept below as comments." if failures.any?
     shrunk.each { |line| lines << "-- Observed on the copy: rows in #{line}" }
@@ -201,22 +228,16 @@ module SqliteDoctorCapture
     sql.sub(/;?\s*\z/, ";")
   end
 
-  # The staging file is created with O_EXCL, so a pre-existing file or
-  # symlink at that name is never followed or truncated.
+  # Tempfile creates the staging file with O_EXCL, so a file or symlink
+  # already at that name is never followed or truncated, and removes it if
+  # the write or the rename fails.
   def write_atomically(output, content)
-    STAGING_ATTEMPTS.times do
-      temporary = "#{output}.#{Process.pid}.#{rand(1 << 32).to_s(16)}.tmp"
-      begin
-        File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o644) do |file|
-          file.write(content)
-        end
-      rescue Errno::EEXIST
-        next
-      end
-      File.rename(temporary, output)
-      return
+    Tempfile.create([File.basename(output), ".tmp"], File.dirname(output)) do |staging|
+      staging.write(content)
+      staging.close
+      File.chmod(0o644 & ~File.umask, staging.path)
+      File.rename(staging.path, output)
     end
-    raise "could not create a staging file next to #{output}"
   end
 end
 

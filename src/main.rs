@@ -3,7 +3,7 @@ use std::io::{self, Read};
 use std::process::ExitCode;
 
 use serde_json::json;
-use sqlite_doctor::{Finding, diagnose, initial_hazards, scan_sql};
+use sqlite_doctor::{Finding, HazardId, diagnose, scan_sql};
 
 #[derive(Clone, Copy)]
 enum OutputFormat {
@@ -60,7 +60,7 @@ fn run(arguments: Vec<String>) -> Result<u8, String> {
 
     match format {
         OutputFormat::Human => print_human(&source, &findings),
-        OutputFormat::Json => print_json(&source, &findings)?,
+        OutputFormat::Json => print_json(&source, &findings),
     }
 
     Ok(u8::from(!findings.is_empty()))
@@ -103,7 +103,7 @@ fn print_human(source: &str, findings: &[Finding]) {
     }
 }
 
-fn print_json(source: &str, findings: &[Finding]) -> Result<(), String> {
+fn print_json(source: &str, findings: &[Finding]) {
     let findings: Vec<_> = findings
         .iter()
         .map(|finding| {
@@ -122,12 +122,7 @@ fn print_json(source: &str, findings: &[Finding]) -> Result<(), String> {
         "source": source,
         "findings": findings,
     });
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&output)
-            .map_err(|error| format!("could not encode JSON output: {error}"))?
-    );
-    Ok(())
+    println!("{output:#}");
 }
 
 fn print_help() {
@@ -138,7 +133,7 @@ fn print_help() {
     println!("or drop indexes and triggers.");
     println!();
     println!("Diagnostics:");
-    for hazard in initial_hazards() {
+    for hazard in HazardId::ALL {
         println!("- {hazard}");
     }
 }

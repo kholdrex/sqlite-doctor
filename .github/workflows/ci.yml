@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
 
 jobs:
@@ -17,6 +17,8 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: cargo test
         run: cargo test --all-features
+      - name: fixtures against sqlite3
+        run: sh tests/sqlite_outcomes.sh
       - name: cargo run
         run: cargo run -- --help
 

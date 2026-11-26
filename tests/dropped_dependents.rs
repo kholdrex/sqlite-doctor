@@ -88,7 +88,6 @@ fn a_dependent_created_again_declares_its_reference_anew() {
 
 #[test]
 fn a_dependent_rebuilt_with_a_new_cascade_before_the_parent_is_still_reported() {
-    // Dropping the old child must not retire the cascade its replacement declares.
     let sql = format!(
         "CREATE TABLE checks (keyword_id INTEGER REFERENCES accounts(id));\n{}{RECREATE_REBUILD}",
         "BEGIN;\nCREATE TEMPORARY TABLE achecks (keyword_id INTEGER);\nINSERT INTO achecks SELECT keyword_id FROM checks;\nDROP TABLE checks;\nCREATE TABLE checks (keyword_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE);\nINSERT INTO checks SELECT keyword_id FROM achecks;\nDROP TABLE achecks;\nCOMMIT;\n"
@@ -113,8 +112,6 @@ fn a_drop_with_trailing_tokens_does_not_retire_the_reference() {
     assert_eq!(cascade_findings(&sql), 1);
 }
 
-/// Inputs where SQLite still deletes the child row at the parent rebuild, so
-/// the reference must stay.
 #[test]
 fn drops_that_do_not_remove_the_child_keep_the_reference() {
     for (name, sql) in [
@@ -148,8 +145,7 @@ fn drops_that_do_not_remove_the_child_keep_the_reference() {
 }
 
 /// Named and quoted transactions, temp shadows brought back by a rollback,
-/// and savepoints whose names the scanner cannot read: SQLite still cascades
-/// into the child.
+/// and nested savepoints of one name: SQLite still cascades into the child.
 #[test]
 fn ambiguous_transactions_and_temp_shadows_keep_the_reference() {
     let dir = concat!(

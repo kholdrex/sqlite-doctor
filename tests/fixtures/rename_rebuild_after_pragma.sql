@@ -1,4 +1,4 @@
--- Drizzle-inspired generated migration. The pragma is outside transaction scope.
+-- Synthetic rename rebuild with foreign keys disabled before BEGIN.
 PRAGMA foreign_keys=OFF;
 BEGIN;
 CREATE TABLE `__new_users` (
