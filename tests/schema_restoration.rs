@@ -1,4 +1,4 @@
-use sqlite_doctor::{HazardId, SchemaObjectKind, diagnose, scan_sql};
+use sqlite_doctor::{Finding, HazardId, ScanReport, SchemaObjectKind, diagnose, scan_sql};
 
 fn rebuild(body_before: &str, body_after_drop: &str) -> String {
     format!(
@@ -6,10 +6,22 @@ fn rebuild(body_before: &str, body_after_drop: &str) -> String {
     )
 }
 
+/// The `SQLD003` findings of an input that holds exactly one rebuild, so a
+/// test for their absence fails when the rebuild is no longer recognized.
+fn missing_after_one_rebuild(sql: &str) -> (ScanReport, Vec<Finding>) {
+    let report = scan_sql(sql);
+    assert_eq!(report.rebuilds.len(), 1, "{sql}");
+    let missing = diagnose(&report)
+        .into_iter()
+        .filter(|finding| finding.hazard == HazardId::MissingSchemaObjectRestoration)
+        .collect();
+    (report, missing)
+}
+
 #[test]
 fn reports_each_explicit_index_and_trigger_not_restored_after_rebuild() {
     let sql = rebuild(
-        "CREATE UNIQUE INDEX idx_users_email ON users(email);\nCREATE TRIGGER users_audit AFTER UPDATE ON users BEGIN INSERT INTO audit_log DEFAULT VALUES; END;",
+        "CREATE UNIQUE INDEX idx_users_email ON users(email);\nCREATE TRIGGER users_audit AFTER UPDATE ON users BEGIN INSERT INTO audit_log(message) VALUES ('updated'); END;",
         "",
     );
 
@@ -37,11 +49,9 @@ fn recreation_on_replacement_table_between_drop_and_rename_is_restored() {
         "CREATE INDEX IF NOT EXISTS idx_users_email ON __new_users(email);\nCREATE TRIGGER users_audit AFTER UPDATE ON __new_users BEGIN SELECT 1; END;",
     );
 
-    assert!(
-        diagnose(&scan_sql(&sql))
-            .iter()
-            .all(|finding| finding.hazard != HazardId::MissingSchemaObjectRestoration)
-    );
+    let (report, missing) = missing_after_one_rebuild(&sql);
+    assert_eq!(report.schema_objects.len(), 4);
+    assert!(missing.is_empty());
 }
 
 #[test]
@@ -51,11 +61,10 @@ fn explicit_object_removal_before_table_drop_is_intentional() {
         "",
     );
 
-    assert!(
-        diagnose(&scan_sql(&sql))
-            .iter()
-            .all(|finding| finding.hazard != HazardId::MissingSchemaObjectRestoration)
-    );
+    let (report, missing) = missing_after_one_rebuild(&sql);
+    assert_eq!(report.schema_objects.len(), 2);
+    assert_eq!(report.dropped_schema_objects.len(), 2);
+    assert!(missing.is_empty());
 }
 
 #[test]
@@ -106,7 +115,9 @@ fn an_object_drop_that_survives_the_transaction_is_a_removal() {
             &format!("CREATE INDEX idx_users_email ON users(email);\n{drops}"),
             "",
         );
-        assert!(diagnose(&scan_sql(&sql)).is_empty(), "{name}");
+        let (report, missing) = missing_after_one_rebuild(&sql);
+        assert_eq!(report.dropped_schema_objects.len(), 1, "{name}");
+        assert!(missing.is_empty(), "{name}");
     }
 }
 
@@ -116,7 +127,9 @@ fn quoted_names_match_recreation_but_different_names_do_not() {
         "CREATE UNIQUE INDEX \"IDX_Email\" ON [users](email);",
         "CREATE INDEX `idx_email` ON `__new_users`(email);",
     );
-    assert!(diagnose(&scan_sql(&restored)).is_empty());
+    let (report, missing) = missing_after_one_rebuild(&restored);
+    assert_eq!(report.schema_objects.len(), 2);
+    assert!(missing.is_empty());
 
     let renamed = rebuild(
         "CREATE INDEX idx_users_email ON users(email);",
@@ -134,12 +147,21 @@ fn quoted_names_match_recreation_but_different_names_do_not() {
 
 #[test]
 fn unrelated_and_post_rebuild_objects_do_not_create_expectations() {
-    let sql = rebuild(
-        "CREATE INDEX idx_orders_state ON orders(state);\nCREATE TRIGGER orders_touch AFTER UPDATE ON orders BEGIN UPDATE users SET email = email; END;\nCREATE VIEW active_users AS SELECT * FROM users;",
-        "CREATE INDEX idx_users_email ON users(email);",
-    );
+    let sql = r#"
+CREATE INDEX idx_orders_state ON orders(state);
+CREATE TRIGGER orders_touch AFTER UPDATE ON orders BEGIN UPDATE users SET email = email; END;
+CREATE TEMP TABLE held_users(id INTEGER, email TEXT);
+INSERT INTO held_users SELECT id, email FROM users;
+DROP TABLE users;
+CREATE TABLE users(id INTEGER, email TEXT);
+INSERT INTO users SELECT id, email FROM held_users;
+CREATE INDEX idx_users_email ON users(email);
+CREATE VIEW active_users AS SELECT * FROM users;
+"#;
 
-    assert!(diagnose(&scan_sql(&sql)).is_empty());
+    let (report, missing) = missing_after_one_rebuild(sql);
+    assert_eq!(report.schema_objects.len(), 3);
+    assert!(missing.is_empty());
 }
 
 #[test]
@@ -283,7 +305,9 @@ fn qualified_object_names_match_only_compatible_qualification() {
         "CREATE INDEX main.idx_users_email ON users(email);",
         "CREATE INDEX idx_users_email ON __new_users(email);",
     );
-    assert!(diagnose(&scan_sql(&restored)).is_empty());
+    let (report, missing) = missing_after_one_rebuild(&restored);
+    assert_eq!(report.schema_objects.len(), 2);
+    assert!(missing.is_empty());
 
     let wrong_schema = rebuild(
         "CREATE INDEX main.idx_users_email ON users(email);",
@@ -323,11 +347,13 @@ INSERT INTO __new_likes SELECT id FROM likes;
 DROP TABLE likes;
 ALTER TABLE __new_likes RENAME TO likes;
 "#;
-    assert!(diagnose(&scan_sql(rename)).is_empty());
+    let (report, missing) = missing_after_one_rebuild(rename);
+    assert_eq!(report.schema_objects.len(), 1);
+    assert!(missing.is_empty());
 }
 
 #[test]
-fn expression_and_multi_column_indexes_keep_the_conservative_check() {
+fn reports_expression_index_and_skips_composite_index_with_removed_column() {
     let sql = r#"
 CREATE TABLE users (id integer, email text, name text);
 CREATE INDEX index_users_on_lower_email ON users (lower(email));
@@ -347,7 +373,7 @@ INSERT INTO users SELECT id, name FROM ausers;
 }
 
 #[test]
-fn literal_index_keys_and_unreadable_column_lists_keep_the_conservative_check() {
+fn literal_index_keys_and_single_quoted_column_names_are_reported() {
     for key in ["1", "NULL", "TRUE", "x'00'", "-1"] {
         let sql = format!(
             "CREATE TABLE t(id);\nCREATE INDEX idx ON t({key});\nCREATE TABLE n(id);\nINSERT INTO n SELECT id FROM t;\nDROP TABLE t;\nALTER TABLE n RENAME TO t;\n"
