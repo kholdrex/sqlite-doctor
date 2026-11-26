@@ -72,12 +72,14 @@ pub struct SchemaObject {
     /// Schema and name the object was created under.
     pub(crate) identity: (String, String),
     pub(crate) table_parts: Vec<String>,
+    /// Schema of the table or view the object is on. A temp trigger can be
+    /// on a main table.
+    pub(crate) table_schema: String,
     /// Indexed columns when every key is a plain column; `None` for triggers
     /// and expression indexes.
     pub(crate) columns: Option<Vec<String>>,
-    /// Neither the object nor its table names a schema, and a temp table
-    /// that the scanner saw dropped has used the table's name: a rollback may
-    /// have brought it back, and the object may be on it.
+    /// Neither the object nor its table names a schema, and a rollback undid
+    /// the drop of a temp table of that name: the object may be on it.
     pub(crate) table_shadowed: bool,
     /// Declared with IF NOT EXISTS, which does nothing if the object exists.
     pub(crate) if_not_exists: bool,
@@ -234,10 +236,20 @@ pub fn scan_sql(sql: &str) -> ScanReport {
         if token_is(tokens, 0, "CREATE")
             && (token_is(tokens, 1, "TEMP") || token_is(tokens, 1, "TEMPORARY"))
             && created_table(statement).is_none()
+            && created_view(statement).is_none()
+            && !create_trigger_prefix(tokens)
         {
             unreadable_temp = true;
         }
-        if let Some(schema_object) = created_schema_object(statement, statement_index, &temps) {
+        if let Some(mut schema_object) = created_schema_object(statement, statement_index, &temps) {
+            // The temp table of that name is back only if its drop was
+            // rolled back.
+            schema_object.table_shadowed &= report.table_changes.iter().any(|change| {
+                change.kind == TableChangeKind::Dropped
+                    && change.undone_at.is_some()
+                    && change.table.0 == "temp"
+                    && schema_object.table_parts.last() == Some(&change.table.1)
+            });
             if schema_object.identity.0 == "temp" {
                 temp_objects.push((schema_object.kind, schema_object.identity.1.clone()));
             }
@@ -286,12 +298,16 @@ pub fn scan_sql(sql: &str) -> ScanReport {
 
     let mut candidates = Vec::<RebuildCandidate>::new();
     let mut temp_tables = TempTables::default();
+    let mut attached = false;
     for (statement_index, (statement, foreign_keys_enabled)) in
         statements.iter().zip(foreign_key_states).enumerate()
     {
+        attached |= token_is(&statement.tokens, 0, "ATTACH");
         let dropped = dropped_table(statement).map(|name| {
-            // An unqualified name a temp table has used may mean either table.
-            let table = (!temp_tables.shadowed(&name)).then(|| owned(temp_tables.resolve(&name)));
+            // An unqualified name may mean a temp table that has used it, or
+            // a table in an attached database.
+            let uncertain = temp_tables.shadowed(&name) || (attached && name.parts.len() == 1);
+            let table = (!uncertain).then(|| owned(temp_tables.resolve(&name)));
             (name, table)
         });
         temp_tables.apply(statement);
@@ -315,14 +331,21 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 });
             }
 
-            // IF NOT EXISTS does nothing to a replacement that is there.
+            // IF NOT EXISTS does nothing to a replacement that is there: one
+            // created earlier and not dropped since.
             let if_not_exists =
                 token_is(&statement.tokens, 2, "IF") || token_is(&statement.tokens, 3, "IF");
-            if if_not_exists
-                && candidates
-                    .iter()
-                    .any(|candidate| candidate.temporary_table.matches(&created))
-            {
+            let still_there = |candidate: &RebuildCandidate| {
+                candidate.temporary_table.matches(&created)
+                    && !report.table_changes.iter().any(|change| {
+                        change.kind == TableChangeKind::Dropped
+                            && change.statement_index > candidate.created_at
+                            && change.statement_index < statement_index
+                            && change.undone_at.is_none()
+                            && change.table.1 == created.leaf()
+                    })
+            };
+            if if_not_exists && candidates.iter().any(still_there) {
                 continue;
             }
             // A new table with the name of an older, incomplete replacement
@@ -340,6 +363,7 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 schema: created_identity(statement, &created).0,
                 temporary_table: created,
                 create_line: statement.line,
+                created_at: statement_index,
                 columns,
                 sources: Vec::new(),
             });
@@ -370,8 +394,10 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 (!rebuilds.is_empty()).then_some((scratch_table, rebuilds))
             });
             let (scratch_table, rebuilds) = copied_back.unwrap_or_default();
-            for rebuild in rebuilds {
-                forget_siblings(&mut candidates, rebuild.drop_statement_index);
+            for (rebuild, schema_matches) in rebuilds {
+                if schema_matches {
+                    forget_siblings(&mut candidates, rebuild.drop_statement_index);
+                }
                 report.rebuilds.push(rebuild);
             }
 
@@ -437,9 +463,24 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 );
                 (!rebuilds.is_empty()).then_some(rebuilds)
             });
-            for rebuild in renamed.into_iter().flatten() {
-                forget_siblings(&mut candidates, rebuild.drop_statement_index);
+            for (rebuild, schema_matches) in renamed.into_iter().flatten() {
+                if schema_matches {
+                    forget_siblings(&mut candidates, rebuild.drop_statement_index);
+                }
                 report.rebuilds.push(rebuild);
+            }
+            // A rename brings a dropped name back like a CREATE does; the
+            // columns of that table are not known here.
+            for source in candidates
+                .iter_mut()
+                .flat_map(|candidate| candidate.sources.iter_mut())
+                .filter(|source| !source.drops.is_empty() && source.table.matches(&original_table))
+            {
+                source.creations.push(Creation {
+                    line: statement.line,
+                    statement_index,
+                    columns: None,
+                });
             }
         }
     }
@@ -951,8 +992,9 @@ fn foreign_keys_assignment(statement: &Statement) -> Option<Option<bool>> {
     })
 }
 
-/// Temporary tables that exist at a point in the input, so an unqualified name
-/// can be resolved the way SQLite does: `temp` first, then `main`.
+/// Temporary tables and views that exist at a point in the input, so an
+/// unqualified name can be resolved the way SQLite does: `temp` first, then
+/// `main`.
 #[derive(Default)]
 struct TempTables {
     names: Vec<String>,
@@ -975,7 +1017,13 @@ impl TempTables {
                     self.names.push(name.leaf().to_string());
                 }
             }
-        } else if let Some(name) = dropped_table(statement)
+        } else if let Some((name, true)) = created_view(statement) {
+            self.ever.insert(name.leaf().to_string());
+            if !self.names.iter().any(|leaf| leaf == name.leaf()) {
+                self.names.push(name.leaf().to_string());
+            }
+        } else if let Some(name) =
+            exact_dropped_table(statement).or_else(|| dropped_table(statement))
             && self.resolve(&name).0 == "temp"
         {
             self.names.retain(|leaf| leaf != name.leaf());
@@ -1147,6 +1195,8 @@ fn created_index(
             && temps.shadowed(&table)
             && temps.resolve(&table).0 != "temp",
         if_not_exists,
+        // An index is in the schema of its table.
+        table_schema: object_identity(&name, false, &table, temps).0,
         table_parts: table.parts,
         columns,
         undone_at: None,
@@ -1201,6 +1251,11 @@ fn created_trigger(
             && temps.shadowed(&table)
             && temps.resolve(&table).0 != "temp",
         if_not_exists,
+        table_schema: match (table.parts.as_slice(), name.parts.as_slice()) {
+            ([schema, _], _) => schema.clone(),
+            (_, [schema, _]) if !temporary => schema.clone(),
+            _ => temps.resolve(&table).0.to_string(),
+        },
         table_parts: table.parts,
         columns: None,
         undone_at: None,
@@ -1383,8 +1438,12 @@ fn after_balanced_parentheses(tokens: &[Token], start: usize) -> Option<usize> {
 
 /// The table a `DROP TABLE [IF EXISTS]` names and the position after it.
 fn drop_table_name(statement: &Statement) -> Option<(Name, usize)> {
+    drop_name(statement, "TABLE")
+}
+
+fn drop_name(statement: &Statement, kind: &str) -> Option<(Name, usize)> {
     let tokens = &statement.tokens;
-    if !token_is(tokens, 0, "DROP") || !token_is(tokens, 1, "TABLE") {
+    if !token_is(tokens, 0, "DROP") || !token_is(tokens, 1, kind) {
         return None;
     }
     let index = if token_is(tokens, 2, "IF") && token_is(tokens, 3, "EXISTS") {
@@ -1400,9 +1459,34 @@ fn dropped_table(statement: &Statement) -> Option<Name> {
 }
 
 /// A malformed drop fails in SQLite, so it must not hide a surviving child.
+/// A view shares the namespace of tables, and its triggers go with it.
 fn exact_dropped_table(statement: &Statement) -> Option<Name> {
-    let (name, end) = drop_table_name(statement)?;
+    let (name, end) = drop_table_name(statement).or_else(|| drop_name(statement, "VIEW"))?;
     (end == statement.tokens.len() && name.parts.len() <= 2).then_some(name)
+}
+
+/// The name in `CREATE [TEMP] VIEW [IF NOT EXISTS]` and whether the view is
+/// temporary.
+fn created_view(statement: &Statement) -> Option<(Name, bool)> {
+    let tokens = &statement.tokens;
+    if !token_is(tokens, 0, "CREATE") {
+        return None;
+    }
+    let temporary = token_is(tokens, 1, "TEMP") || token_is(tokens, 1, "TEMPORARY");
+    let mut index = 1 + usize::from(temporary);
+    if !token_is(tokens, index, "VIEW") {
+        return None;
+    }
+    index += 1;
+    if token_is(tokens, index, "IF")
+        && token_is(tokens, index + 1, "NOT")
+        && token_is(tokens, index + 2, "EXISTS")
+    {
+        index += 3;
+    }
+    let (name, _) = parse_name(tokens, index)?;
+    let temporary = temporary || name.parts.first().is_some_and(|schema| schema == "temp");
+    Some((name, temporary))
 }
 
 fn owned((schema, table): (&str, &str)) -> (String, String) {
@@ -1500,6 +1584,7 @@ struct RebuildCandidate {
     temporary_table: Name,
     schema: String,
     create_line: usize,
+    created_at: usize,
     columns: Option<Vec<String>>,
     sources: Vec<CopySource>,
 }
@@ -1521,7 +1606,7 @@ impl RebuildCandidate {
         original: &Name,
         wanted: (&str, &str),
         completed: (usize, usize),
-    ) -> Vec<RebuildSequence> {
+    ) -> Vec<(RebuildSequence, bool)> {
         let undone = |drop: &DropPoint| {
             report.table_changes.iter().any(|change| {
                 change.statement_index == drop.statement_index
@@ -1559,7 +1644,10 @@ impl RebuildCandidate {
                 .as_ref()
                 .is_none_or(|(schema, table)| (schema.as_str(), table.as_str()) == wanted)
         };
-        if drops.iter().any(|(_, drop)| in_schema(drop)) {
+        // With no drop in that schema, a drop of the name elsewhere is still
+        // reported, but left for the candidate it may belong to.
+        let schema_matches = drops.iter().any(|(_, drop)| in_schema(drop));
+        if schema_matches {
             drops.retain(|(_, drop)| in_schema(drop));
         }
         (0..drops.len())
@@ -1572,7 +1660,7 @@ impl RebuildCandidate {
             })
             .map(|position| {
                 let (source, drop) = drops[position];
-                self.rebuild(kind, source, drop, completed)
+                (self.rebuild(kind, source, drop, completed), schema_matches)
             })
             .collect()
     }

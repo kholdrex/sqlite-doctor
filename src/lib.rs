@@ -129,7 +129,7 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
     for rebuild in &report.rebuilds {
         let at = rebuild.drop_statement_index;
         for schema_object in &report.schema_objects {
-            let (_, tables) = tables_at(report, schema_object, at);
+            let tables = tables_at(report, schema_object, at).names;
             if !exists_at(report, schema_object, at)
                 || !tables
                     .iter()
@@ -182,7 +182,7 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
             // Skip a plain-column index if the replacement omits one of its
             // keys under every name the key has had.
             let column_removed = schema_object.columns.as_ref().is_some_and(|columns| {
-                rebuild.replacement_columns.as_ref().is_some_and(|kept| {
+                replacement_columns(report, rebuild).is_some_and(|kept| {
                     columns.iter().any(|column| {
                         !column_names(report, schema_object, &tables, column, at)
                             .iter()
@@ -279,11 +279,12 @@ fn reference_at(
     }
 
     let mut dependent = identity.1.clone();
-    // The old name stays a candidate in case the rename did not take place.
     let mut referenced = vec![reference.referenced_table_parts.clone()];
     for change in since_declared() {
         let TableChangeKind::RenamedTo {
-            name, unqualified, ..
+            name,
+            unqualified,
+            shadowed,
         } = &change.kind
         else {
             continue;
@@ -295,11 +296,14 @@ fn reference_at(
         if *schema == identity.0 && *table == dependent {
             dependent = name.clone();
         }
-        // An unqualified rename may apply in the dependent's schema even
-        // when it was resolved to another one.
-        if (*unqualified || *schema == identity.0)
-            && referenced.iter().any(|parent| parent.last() == Some(table))
-        {
+        let renamed = |parent: &Vec<String>| parent.last() == Some(table);
+        if *schema == identity.0 && !shadowed {
+            for parent in referenced.iter_mut().filter(|parent| renamed(parent)) {
+                *parent = vec![name.clone()];
+            }
+        } else if *unqualified && referenced.iter().any(renamed) {
+            // The rename may have hit a table of that name in the
+            // dependent's schema; both names stay candidates.
             referenced.push(vec![name.clone()]);
         }
     }
@@ -341,17 +345,20 @@ fn created(report: &ScanReport, schema_object: &SchemaObject) -> bool {
 /// a plain CREATE of the same name on the same table, which succeeds only
 /// once the object is gone and then stands for it.
 fn exists_at(report: &ScanReport, schema_object: &SchemaObject, at: usize) -> bool {
-    let table_at = |statement: usize| tables_at(report, schema_object, statement).0;
+    // Where the table's name is not certain, nothing is taken as gone.
+    let table_at = |statement: usize| {
+        let tables = tables_at(report, schema_object, statement);
+        tables.certain.then_some(tables.current)
+    };
     let created_again = report.schema_objects.iter().any(|later| {
         later.kind == schema_object.kind
             && later.identity == schema_object.identity
             && later.statement_index > schema_object.statement_index
             && !later.if_not_exists
             && holds_at(later.statement_index, later.undone_at, at)
-            && name_parts_match(
-                &table_at(later.statement_index),
-                effective_table_parts(later, &report.rebuilds),
-            )
+            && table_at(later.statement_index).is_some_and(|table| {
+                name_parts_match(&table, effective_table_parts(later, &report.rebuilds))
+            })
     });
     let dropped = report.dropped_schema_objects.iter().any(|dropped| {
         dropped.kind == schema_object.kind
@@ -359,13 +366,13 @@ fn exists_at(report: &ScanReport, schema_object: &SchemaObject, at: usize) -> bo
             && dropped.statement_index > schema_object.statement_index
             && holds_at(dropped.statement_index, dropped.undone_at, at)
     });
-    // The object lives in the schema of its table.
     let table_dropped = report.table_changes.iter().any(|change| {
         change.kind == TableChangeKind::Dropped
             && change.statement_index > schema_object.statement_index
             && holds_at(change.statement_index, change.undone_at, at)
-            && change.table.0 == schema_object.identity.0
-            && table_at(change.statement_index).last() == Some(&change.table.1)
+            && change.table.0 == schema_object.table_schema
+            && table_at(change.statement_index)
+                .is_some_and(|table| table.last() == Some(&change.table.1))
     });
     let lost_in_rebuild = report.rebuilds.iter().any(|rebuild| {
         let original = &rebuild.original_table_parts;
@@ -375,14 +382,31 @@ fn exists_at(report: &ScanReport, schema_object: &SchemaObject, at: usize) -> bo
                 drop_undone_at(report, rebuild),
                 at,
             )
-            && (original.len() == 1 || original[0] == schema_object.identity.0)
-            && name_parts_match(&table_at(rebuild.drop_statement_index), original)
+            && (original.len() == 1 || original[0] == schema_object.table_schema)
+            && table_at(rebuild.drop_statement_index)
+                .is_some_and(|table| name_parts_match(&table, original))
     });
     holds_at(schema_object.statement_index, schema_object.undone_at, at)
         && !dropped
         && !table_dropped
         && !lost_in_rebuild
         && !created_again
+}
+
+/// The columns of the table that takes the original's place, under every name
+/// a `RENAME COLUMN` on the replacement gave them before the swap.
+fn replacement_columns(report: &ScanReport, rebuild: &RebuildSequence) -> Option<Vec<String>> {
+    let mut columns = rebuild.replacement_columns.clone()?;
+    for rename in &report.column_renames {
+        if rename.statement_index < rebuild.replacement_statement_index
+            && rebuild.kind == RebuildKind::Rename
+            && columns.contains(&rename.from)
+            && name_parts_match(&rename.table_parts, &rebuild.temporary_table_parts)
+        {
+            columns.push(rename.to.clone());
+        }
+    }
+    Some(columns)
 }
 
 /// Every name an indexed column may have when statement `at` runs, following
@@ -422,22 +446,35 @@ fn dropped_between(report: &ScanReport, table: &[String], from: usize, to: usize
     dropped
         || report.rebuilds.iter().any(|rebuild| {
             rebuild.drop_statement_index > from
-                && rebuild.drop_statement_index < to
+                && holds_at(
+                    rebuild.drop_statement_index,
+                    drop_undone_at(report, rebuild),
+                    to,
+                )
                 && name_parts_match(&rebuild.original_table_parts, table)
         })
 }
 
-/// The table of an index or trigger when statement `at` runs, and every name
-/// that table may have then: the object stays on its table through
-/// `ALTER TABLE ... RENAME TO`, and the old names stay candidates in case a
-/// rename did not take place.
-fn tables_at(
-    report: &ScanReport,
-    schema_object: &SchemaObject,
-    at: usize,
-) -> (Vec<String>, Vec<Vec<String>>) {
-    let mut current = effective_table_parts(schema_object, &report.rebuilds).to_vec();
-    let mut names = vec![current.clone()];
+/// Where an index or trigger is when a statement runs.
+struct ObjectTables {
+    /// Its table, following renames in order.
+    current: Vec<String>,
+    /// Every name the table may have: a rename that may have hit another
+    /// table of that name adds one instead of replacing the old one.
+    names: Vec<Vec<String>>,
+    /// No such rename applied, so `current` is the table.
+    certain: bool,
+}
+
+/// The table of an index or trigger when statement `at` runs: the object stays
+/// on its table through `ALTER TABLE ... RENAME TO`.
+fn tables_at(report: &ScanReport, schema_object: &SchemaObject, at: usize) -> ObjectTables {
+    let current = effective_table_parts(schema_object, &report.rebuilds).to_vec();
+    let mut tables = ObjectTables {
+        names: vec![current.clone()],
+        current,
+        certain: true,
+    };
     for change in &report.table_changes {
         let TableChangeKind::RenamedTo {
             name,
@@ -453,20 +490,22 @@ fn tables_at(
             continue;
         }
         let (schema, table) = &change.table;
-        // The object lives in the schema of its table.
-        let renames = |candidate: &Vec<String>| {
-            candidate.last() == Some(table) && (*unqualified || *schema == schema_object.identity.0)
-        };
-        // A rename that may have hit a temp table of the same name adds a
-        // candidate but does not move the object.
-        if renames(&current) && !shadowed {
-            current = vec![name.clone()];
-        }
-        if names.iter().any(renames) {
-            names.push(vec![name.clone()]);
+        let renamed = |candidate: &Vec<String>| candidate.last() == Some(table);
+        if *schema == schema_object.table_schema && !shadowed {
+            for candidate in tables.names.iter_mut().filter(|name| renamed(name)) {
+                *candidate = vec![name.clone()];
+            }
+            if renamed(&tables.current) {
+                tables.current = vec![name.clone()];
+            }
+        } else if *unqualified && tables.names.iter().any(renamed) {
+            // The rename may have hit a temp table of that name, or the
+            // object's table in another schema than the one resolved.
+            tables.names.push(vec![name.clone()]);
+            tables.certain = false;
         }
     }
-    (current, names)
+    tables
 }
 
 fn effective_table_parts<'a>(
