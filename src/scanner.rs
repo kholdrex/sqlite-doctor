@@ -41,6 +41,9 @@ pub struct RebuildSequence {
     pub(crate) replacement_statement_index: usize,
     pub(crate) temporary_table_parts: Vec<String>,
     pub(crate) original_table_parts: Vec<String>,
+    /// Schema of the dropped table, when the drop names or resolves to one
+    /// with certainty.
+    pub(crate) original_schema: Option<String>,
     /// Columns of the table that takes the original name, when its CREATE
     /// TABLE lists them.
     pub(crate) replacement_columns: Option<Vec<String>>,
@@ -131,6 +134,9 @@ pub struct DeleteActionReference {
     /// Schema and table from the CREATE TABLE that declared the reference.
     pub(crate) dependent_identity: (String, String),
     pub(crate) referenced_table_parts: Vec<String>,
+    /// The column that declares the reference inline. `DROP COLUMN` takes
+    /// such a reference with it; a table constraint has none.
+    pub(crate) column: Option<String>,
     /// The `ROLLBACK` that undid the CREATE TABLE, if one did.
     pub(crate) undone_at: Option<usize>,
 }
@@ -153,6 +159,10 @@ pub(crate) enum TableChangeKind {
     Dropped,
     RenamedTo {
         name: String,
+        /// Whether SQLite rewrote references to the table in other tables:
+        /// not with `legacy_alter_table` on and foreign keys off. `None`
+        /// when those settings are not known.
+        rewrites_references: Option<bool>,
         /// The old name has no schema, so the rename may have hit a table of
         /// that name in another schema than the one resolved here.
         unqualified: bool,
@@ -170,16 +180,16 @@ pub struct ScanReport {
     pub schema_objects: Vec<SchemaObject>,
     pub dropped_schema_objects: Vec<DroppedSchemaObject>,
     pub(crate) table_changes: Vec<TableChange>,
-    pub(crate) column_renames: Vec<ColumnRename>,
+    pub(crate) column_changes: Vec<ColumnChange>,
 }
 
-/// An `ALTER TABLE ... RENAME COLUMN`.
+/// An `ALTER TABLE ... RENAME COLUMN`, or with `to` empty a `DROP COLUMN`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ColumnRename {
+pub(crate) struct ColumnChange {
     pub(crate) statement_index: usize,
     pub(crate) table_parts: Vec<String>,
     pub(crate) from: String,
-    pub(crate) to: String,
+    pub(crate) to: Option<String>,
 }
 
 /// Recognizes copy/drop/rename and copy-out/drop/recreate/copy-back rebuilds.
@@ -189,6 +199,8 @@ pub fn scan_sql(sql: &str) -> ScanReport {
     let statements = statements(sql);
     let mut report = ScanReport::default();
     let mut foreign_keys_enabled = None;
+    let mut legacy_alter_table = Some(false);
+    let mut attached = false;
     let mut foreign_key_states = Vec::with_capacity(statements.len());
     let mut journal = TransactionJournal::default();
     let mut temps = TempTables::default();
@@ -196,6 +208,7 @@ pub fn scan_sql(sql: &str) -> ScanReport {
     let mut unreadable_temp = false;
 
     for (statement_index, statement) in statements.iter().enumerate() {
+        attached |= token_is(&statement.tokens, 0, "ATTACH");
         if let Some(name) = exact_dropped_table(statement) {
             let table = if name.parts.len() == 1 && (unreadable_temp || temps.shadowed(&name)) {
                 ("temp".to_string(), name.leaf().to_string())
@@ -215,14 +228,23 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 table: owned(temps.resolve(&from)),
                 kind: TableChangeKind::RenamedTo {
                     name: to.leaf().to_string(),
+                    rewrites_references: match (legacy_alter_table, foreign_keys_enabled) {
+                        (Some(false), _) | (_, Some(true)) => Some(true),
+                        (Some(true), Some(false)) => Some(false),
+                        _ => None,
+                    },
                     unqualified: from.parts.len() == 1,
-                    shadowed: unreadable_temp || temps.shadowed(&from),
+                    // After ATTACH an unqualified name may also mean a table
+                    // in the attached database.
+                    shadowed: unreadable_temp
+                        || temps.shadowed(&from)
+                        || (attached && from.parts.len() == 1),
                 },
                 undone_at: None,
             });
             journal.record(Undoable::TableChange(report.table_changes.len() - 1));
-        } else if let Some((table, from, to)) = renamed_column(statement) {
-            report.column_renames.push(ColumnRename {
+        } else if let Some((table, from, to)) = changed_column(statement) {
+            report.column_changes.push(ColumnChange {
                 statement_index,
                 table_parts: table.parts,
                 from,
@@ -242,14 +264,18 @@ pub fn scan_sql(sql: &str) -> ScanReport {
             unreadable_temp = true;
         }
         if let Some(mut schema_object) = created_schema_object(statement, statement_index, &temps) {
-            // The temp table of that name is back only if its drop was
+            // The temp table of that name is back only if its last drop was
             // rolled back.
-            schema_object.table_shadowed &= report.table_changes.iter().any(|change| {
-                change.kind == TableChangeKind::Dropped
-                    && change.undone_at.is_some()
-                    && change.table.0 == "temp"
-                    && schema_object.table_parts.last() == Some(&change.table.1)
-            });
+            schema_object.table_shadowed &= report
+                .table_changes
+                .iter()
+                .rev()
+                .find(|change| {
+                    change.kind == TableChangeKind::Dropped
+                        && change.table.0 == "temp"
+                        && schema_object.table_parts.last() == Some(&change.table.1)
+                })
+                .is_some_and(|last_drop| last_drop.undone_at.is_some());
             if schema_object.identity.0 == "temp" {
                 temp_objects.push((schema_object.kind, schema_object.identity.1.clone()));
             }
@@ -282,7 +308,10 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 report.delete_action_references.len() - 1,
             ));
         }
-        match foreign_keys_assignment(statement) {
+        if let Some(value) = pragma_assignment(statement, "legacy_alter_table") {
+            legacy_alter_table = value;
+        }
+        match pragma_assignment(statement, "foreign_keys") {
             Some(Some(enabled)) if journal.in_transaction => report
                 .foreign_keys_pragmas_in_transactions
                 .push(ForeignKeysPragmaInTransaction {
@@ -331,21 +360,20 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 });
             }
 
-            // IF NOT EXISTS does nothing to a replacement that is there: one
-            // created earlier and not dropped since.
+            // IF NOT EXISTS does nothing to a replacement that is there. Whether
+            // it is there is not tracked, so the copies stay and the columns
+            // are unknown when the two declarations disagree.
             let if_not_exists =
                 token_is(&statement.tokens, 2, "IF") || token_is(&statement.tokens, 3, "IF");
-            let still_there = |candidate: &RebuildCandidate| {
-                candidate.temporary_table.matches(&created)
-                    && !report.table_changes.iter().any(|change| {
-                        change.kind == TableChangeKind::Dropped
-                            && change.statement_index > candidate.created_at
-                            && change.statement_index < statement_index
-                            && change.undone_at.is_none()
-                            && change.table.1 == created.leaf()
-                    })
-            };
-            if if_not_exists && candidates.iter().any(still_there) {
+            if if_not_exists
+                && let Some(candidate) = candidates
+                    .iter_mut()
+                    .rev()
+                    .find(|candidate| candidate.temporary_table.matches(&created))
+            {
+                if candidate.columns != columns {
+                    candidate.columns = None;
+                }
                 continue;
             }
             // A new table with the name of an older, incomplete replacement
@@ -363,7 +391,6 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 schema: created_identity(statement, &created).0,
                 temporary_table: created,
                 create_line: statement.line,
-                created_at: statement_index,
                 columns,
                 sources: Vec::new(),
             });
@@ -950,16 +977,16 @@ enum Rollback {
     Unresolved,
 }
 
-/// The value a `PRAGMA foreign_keys` assignment asks for: `None` for other
-/// statements and for the query form, `Some(None)` when the value cannot be
-/// read.
-fn foreign_keys_assignment(statement: &Statement) -> Option<Option<bool>> {
+/// The value an assignment to the boolean pragma `pragma` asks for: `None` for
+/// other statements and for the query form, `Some(None)` when the value
+/// cannot be read.
+fn pragma_assignment(statement: &Statement, pragma: &str) -> Option<Option<bool>> {
     let tokens = &statement.tokens;
     if !token_is(tokens, 0, "PRAGMA") {
         return None;
     }
     let (name, index) = parse_name(tokens, 1)?;
-    if name.leaf() != "foreign_keys" || name.parts.len() > 2 {
+    if name.leaf() != pragma || name.parts.len() > 2 {
         return None;
     }
     let parenthesized = symbol_is(tokens, index, '(');
@@ -1010,7 +1037,7 @@ impl TempTables {
         if let Some((name, _)) = created_table(statement) {
             let temporary = token_is(tokens, 1, "TEMP")
                 || token_is(tokens, 1, "TEMPORARY")
-                || name.parts.first().is_some_and(|schema| schema == "temp");
+                || matches!(name.parts.as_slice(), [schema, _] if schema == "temp");
             if temporary {
                 self.ever.insert(name.leaf().to_string());
                 if !self.names.iter().any(|leaf| leaf == name.leaf()) {
@@ -1213,7 +1240,7 @@ fn created_trigger(
         return None;
     }
     let mut index = 1;
-    let temporary = token_is(tokens, index, "TEMP") || token_is(tokens, index, "TEMPORARY");
+    let mut temporary = token_is(tokens, index, "TEMP") || token_is(tokens, index, "TEMPORARY");
     if temporary {
         index += 1;
     }
@@ -1228,6 +1255,9 @@ fn created_trigger(
         index += 3;
     }
     let (name, index) = parse_name(tokens, index)?;
+    // `CREATE TRIGGER temp.t` is a temp trigger too, and like one it may be
+    // on a main table.
+    temporary |= matches!(name.parts.as_slice(), [schema, _] if schema == "temp");
     let (table, _) = (index..tokens.len()).find_map(|position| {
         if !token_is(tokens, position, "ON") {
             return None;
@@ -1327,6 +1357,11 @@ fn delete_action_references(
                 statement_index,
                 dependent_identity: created_identity(statement, &dependent_table),
                 referenced_table_parts: referenced_table.parts,
+                column: (!["CONSTRAINT", "FOREIGN"]
+                    .iter()
+                    .any(|keyword| token_is(tokens, start, keyword)))
+                .then(|| identifier(&tokens[start]))
+                .flatten(),
                 undone_at: None,
             });
         }
@@ -1485,7 +1520,7 @@ fn created_view(statement: &Statement) -> Option<(Name, bool)> {
         index += 3;
     }
     let (name, _) = parse_name(tokens, index)?;
-    let temporary = temporary || name.parts.first().is_some_and(|schema| schema == "temp");
+    let temporary = temporary || matches!(name.parts.as_slice(), [schema, _] if schema == "temp");
     Some((name, temporary))
 }
 
@@ -1518,22 +1553,27 @@ fn renamed_table(statement: &Statement) -> Option<(Name, Name)> {
     (end == tokens.len()).then_some((from, to))
 }
 
-fn renamed_column(statement: &Statement) -> Option<(Name, String, String)> {
+/// The table and column of `ALTER TABLE ... RENAME [COLUMN] a TO b` (with the
+/// new name) or `ALTER TABLE ... DROP [COLUMN] a` (without one).
+fn changed_column(statement: &Statement) -> Option<(Name, String, Option<String>)> {
     let tokens = &statement.tokens;
     if !token_is(tokens, 0, "ALTER") || !token_is(tokens, 1, "TABLE") {
         return None;
     }
     let (table, mut index) = parse_name(tokens, 2)?;
-    if !token_is(tokens, index, "RENAME") || token_is(tokens, index + 1, "TO") {
+    let dropped = token_is(tokens, index, "DROP");
+    if !dropped && (!token_is(tokens, index, "RENAME") || token_is(tokens, index + 1, "TO")) {
         return None;
     }
     index += 1 + usize::from(token_is(tokens, index + 1, "COLUMN"));
     let from = identifier(tokens.get(index)?)?;
+    if dropped {
+        return Some((table, from, None));
+    }
     if !token_is(tokens, index + 1, "TO") {
         return None;
     }
-    let to = identifier(tokens.get(index + 2)?)?;
-    Some((table, from, to))
+    Some((table, from, Some(identifier(tokens.get(index + 2)?)?)))
 }
 
 /// Other copies taken before the same DROP describe the same destroyed table;
@@ -1584,7 +1624,6 @@ struct RebuildCandidate {
     temporary_table: Name,
     schema: String,
     create_line: usize,
-    created_at: usize,
     columns: Option<Vec<String>>,
     sources: Vec<CopySource>,
 }
@@ -1703,6 +1742,7 @@ impl RebuildCandidate {
             replacement_statement_index,
             temporary_table_parts: self.temporary_table.parts.clone(),
             original_table_parts: source.table.parts.clone(),
+            original_schema: drop.table.as_ref().map(|(schema, _)| schema.clone()),
             replacement_columns,
         }
     }
