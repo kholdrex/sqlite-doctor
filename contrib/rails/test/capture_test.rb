@@ -14,6 +14,10 @@ require_relative "../sqlite_doctor_capture"
 
 ActiveRecord::Migration.verbose = false
 
+class SecondaryRecord < ActiveRecord::Base
+  self.abstract_class = true
+end
+
 class CaptureTest < Minitest::Test
   SCHEMA = <<~SQL.freeze
     CREATE TABLE tenants (id INTEGER PRIMARY KEY);
@@ -121,16 +125,69 @@ class CaptureTest < Minitest::Test
   end
 
   def test_refuses_when_another_pool_uses_the_original
-    other = Class.new(ActiveRecord::Base) do
-      self.abstract_class = true
-      def self.name = "OtherRecord"
+    migration("add_column :parents, :extra, :text")
+
+    [@database, "file:#{@database}", "file://#{@database}?mode=rw",
+     "file:#{@database}?mode=memory&mode=rw", "file:#{@database}?mode=memory&%6dode=rw",
+     "file://localhost#{@database.gsub('t', '%74')}#fragment"].each do |database|
+      SecondaryRecord.establish_connection(adapter: "sqlite3", database: database)
+
+      error = assert_raises(RuntimeError, database) { capture }
+      assert_match(/connection pool .* also uses/, error.message, database)
+      refute File.exist?(@output), database
     end
-    other.establish_connection(adapter: "sqlite3", database: @database)
+  ensure
+    SecondaryRecord.remove_connection
+  end
+
+  def test_refuses_a_pool_whose_uri_names_another_host
+    SecondaryRecord.establish_connection(adapter: "sqlite3", database: "file://elsewhere#{@database}")
     migration("add_column :parents, :extra, :text")
 
     error = assert_raises(RuntimeError) { capture }
-    assert_match(/connection pool .* also uses/, error.message)
+    assert_match(/cannot tell which file/, error.message)
     refute File.exist?(@output)
+  ensure
+    SecondaryRecord.remove_connection
+  end
+
+  def test_allows_pools_on_in_memory_and_other_databases
+    migration("add_column :parents, :extra, :text")
+
+    [":memory:", "file::memory:?cache=shared", "file:shared?mode=memory&cache=shared",
+     "file:#{File.join(@dir, 'other.sqlite3')}"].each do |database|
+      SecondaryRecord.establish_connection(adapter: "sqlite3", database: database)
+
+      assert_nil capture[:error], database
+    end
+  ensure
+    SecondaryRecord.remove_connection
+  end
+
+  def test_sql_sent_to_another_database_is_not_captured
+    SecondaryRecord.establish_connection(adapter: "sqlite3", database: File.join(@dir, "other.sqlite3"))
+    migration(<<~RUBY)
+      SecondaryRecord.connection_pool.with_connection do |connection|
+        connection.transaction do
+          connection.execute("CREATE TABLE elsewhere (id INTEGER)")
+          connection.execute("PRAGMA foreign_keys = OFF")
+        end
+      end
+      add_column :parents, :extra, :text
+    RUBY
+
+    result = capture
+    sql = File.read(@output)
+
+    assert_nil result[:error]
+    assert_equal ["elsewhere"], SQLite3::Database.new(File.join(@dir, "other.sqlite3")) { |db|
+      break db.execute("SELECT name FROM sqlite_schema").flatten
+    }
+    assert_includes sql, 'ALTER TABLE "parents" ADD "extra" text'
+    refute_includes sql, "elsewhere"
+    refute_includes sql, "PRAGMA foreign_keys = OFF"
+  ensure
+    SecondaryRecord.remove_connection
   end
 
   def test_fails_when_a_migration_writes_the_original_through_its_own_connection
@@ -180,16 +237,29 @@ class CaptureTest < Minitest::Test
     File.singleton_class.send(:define_method, :open, real_open)
   end
 
-  def test_a_wal_checkpoint_on_close_is_not_a_change
+  def test_a_wal_checkpoint_while_migrating_is_not_a_change
     SQLite3::Database.new(@database) { |db| db.execute("PRAGMA journal_mode = WAL") }
     holder = SQLite3::Database.new(@database)
     holder.execute("INSERT INTO tenants VALUES (2)")
     migration("add_column :parents, :extra, :text")
-    SqliteDoctorCapture.singleton_class.prepend(Module.new do
-      define_method(:row_counts) { |connection| holder.close unless holder.closed?; super(connection) }
-    end)
+    before = original_digest
+    checkpoint = nil
+    run_migrations = SqliteDoctorCapture.method(:run_migrations)
+    SqliteDoctorCapture.define_singleton_method(:run_migrations) do |*arguments|
+      checkpoint = holder.execute("PRAGMA wal_checkpoint(FULL)").first
+      run_migrations.call(*arguments)
+    end
 
-    assert_nil capture[:error]
+    result = capture
+
+    assert_nil result[:error]
+    busy, _, checkpointed_frames = checkpoint
+    assert_equal 0, busy
+    assert_operator checkpointed_frames, :>, 0
+    refute_equal before, original_digest
+  ensure
+    SqliteDoctorCapture.define_singleton_method(:run_migrations, run_migrations)
+    holder&.close
   end
 
   def test_leaves_activerecord_unconnected_when_it_started_unconnected
