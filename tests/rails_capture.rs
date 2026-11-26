@@ -53,6 +53,32 @@ fn rails_rebuild_reports_the_dropped_trigger_but_not_restored_indexes() {
 }
 
 #[test]
+fn three_rails_rebuilds_of_one_table_report_each_cascade_and_no_lost_index() {
+    let sql = include_str!("fixtures/rails_8_1_three_rebuilds_of_one_table.sql");
+    let report = scan_sql(sql);
+
+    assert_eq!(report.rebuilds.len(), 3);
+    for rebuild in &report.rebuilds {
+        assert_eq!(rebuild.kind, RebuildKind::Recreate);
+        assert_eq!(rebuild.original_table, "parents");
+    }
+    assert_eq!(
+        codes(sql),
+        vec![
+            ("SQLD002", 41),
+            ("SQLD001", 103),
+            ("SQLD002", 167),
+            ("SQLD002", 187),
+            ("SQLD001", 249),
+            ("SQLD002", 312),
+            ("SQLD002", 329),
+            ("SQLD001", 377),
+            ("SQLD002", 427),
+        ]
+    );
+}
+
+#[test]
 fn recreate_shape_requires_copying_rows_back() {
     let sql = r#"
 CREATE TABLE posts (id integer);

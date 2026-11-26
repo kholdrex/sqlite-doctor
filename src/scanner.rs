@@ -1,10 +1,8 @@
-//! A small, dependency-free lexical scanner for SQLite migration text.
+//! Scans one SQLite SQL input for table rebuilds and foreign-key pragmas.
 //!
-//! This is deliberately not a general SQL parser. It splits a single SQLite
-//! input, classifies a narrow statement vocabulary, tracks lexical transaction
-//! state, and anchors structural table-rebuild patterns. It cannot observe
-//! framework-injected transactions, dynamic SQL, runtime-selected pragmas, or
-//! state carried across inputs.
+//! This is a lexical scanner, not a SQL parser. It cannot see a transaction a
+//! framework opens around the input, SQL built at run time, or state left by
+//! other inputs.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForeignKeysPragmaInTransaction {
@@ -71,11 +69,20 @@ pub struct SchemaObject {
     /// One-based source line containing the CREATE statement.
     pub line: usize,
     pub(crate) statement_index: usize,
-    pub(crate) name_parts: Vec<String>,
+    /// Schema and name the object was created under.
+    pub(crate) identity: (String, String),
     pub(crate) table_parts: Vec<String>,
     /// Indexed columns when every key is a plain column; `None` for triggers
     /// and expression indexes.
     pub(crate) columns: Option<Vec<String>>,
+    /// Neither the object nor its table names a schema, and a temp table
+    /// that the scanner saw dropped has used the table's name: a rollback may
+    /// have brought it back, and the object may be on it.
+    pub(crate) table_shadowed: bool,
+    /// Declared with IF NOT EXISTS, which does nothing if the object exists.
+    pub(crate) if_not_exists: bool,
+    /// The `ROLLBACK` that undid the creation, if one did.
+    pub(crate) undone_at: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +92,9 @@ pub struct DroppedSchemaObject {
     /// One-based source line containing the DROP statement.
     pub line: usize,
     pub(crate) statement_index: usize,
-    pub(crate) name_parts: Vec<String>,
+    /// Schema and name the drop removes. An unqualified name already used by
+    /// a temp index or trigger counts as temp, which keeps a main object.
+    pub(crate) identity: (String, String),
     /// The `ROLLBACK` that undid the drop, if one did.
     pub(crate) undone_at: Option<usize>,
 }
@@ -120,25 +129,35 @@ pub struct DeleteActionReference {
     /// Schema and table from the CREATE TABLE that declared the reference.
     pub(crate) dependent_identity: (String, String),
     pub(crate) referenced_table_parts: Vec<String>,
-}
-
-/// A `DROP TABLE`, and the statement that undid it if a `ROLLBACK` or
-/// `ROLLBACK TO` an earlier savepoint did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DroppedTable {
-    pub(crate) statement_index: usize,
-    /// Schema and table the drop removes. An unqualified name already used by
-    /// a temp table counts as temp, which keeps a main child's reference.
-    pub(crate) table: (String, String),
+    /// The `ROLLBACK` that undid the CREATE TABLE, if one did.
     pub(crate) undone_at: Option<usize>,
 }
 
-/// An `ALTER TABLE ... RENAME TO`, resolved like a drop.
+/// A `DROP TABLE` or an `ALTER TABLE ... RENAME TO`, and the statement that
+/// undid it if a `ROLLBACK` or `ROLLBACK TO` an earlier savepoint did.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RenamedTable {
+pub(crate) struct TableChange {
     pub(crate) statement_index: usize,
-    pub(crate) from: (String, String),
-    pub(crate) to: (String, String),
+    /// Schema and table the statement names. In a drop, an unqualified name
+    /// already used by a temp table counts as temp, which keeps a main
+    /// child's reference.
+    pub(crate) table: (String, String),
+    pub(crate) kind: TableChangeKind,
+    pub(crate) undone_at: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TableChangeKind {
+    Dropped,
+    RenamedTo {
+        name: String,
+        /// The old name has no schema, so the rename may have hit a table of
+        /// that name in another schema than the one resolved here.
+        unqualified: bool,
+        /// A temp table has used the old name, so the rename may have hit
+        /// that temp table.
+        shadowed: bool,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -148,16 +167,22 @@ pub struct ScanReport {
     pub delete_action_references: Vec<DeleteActionReference>,
     pub schema_objects: Vec<SchemaObject>,
     pub dropped_schema_objects: Vec<DroppedSchemaObject>,
-    pub(crate) dropped_tables: Vec<DroppedTable>,
-    pub(crate) renamed_tables: Vec<RenamedTable>,
+    pub(crate) table_changes: Vec<TableChange>,
+    pub(crate) column_renames: Vec<ColumnRename>,
 }
 
-/// Scans one SQLite SQL input for transaction-scoped foreign-key pragmas,
-/// structural create/copy/drop/rename table-rebuild patterns, and explicit
-/// index/trigger lifecycle evidence.
-///
-/// The result reflects only lexical SQL present in `sql`; a rebuild match is a
-/// pattern anchor, not proof that the sequence is unsafe at runtime.
+/// An `ALTER TABLE ... RENAME COLUMN`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ColumnRename {
+    pub(crate) statement_index: usize,
+    pub(crate) table_parts: Vec<String>,
+    pub(crate) from: String,
+    pub(crate) to: String,
+}
+
+/// Recognizes copy/drop/rename and copy-out/drop/recreate/copy-back rebuilds.
+/// Records the foreign-key pragmas, `ON DELETE` references, indexes and
+/// triggers in the input.
 pub fn scan_sql(sql: &str) -> ScanReport {
     let statements = statements(sql);
     let mut report = ScanReport::default();
@@ -165,32 +190,39 @@ pub fn scan_sql(sql: &str) -> ScanReport {
     let mut foreign_key_states = Vec::with_capacity(statements.len());
     let mut journal = TransactionJournal::default();
     let mut temps = TempTables::default();
-    let mut temp_leaves = std::collections::HashSet::new();
+    let mut temp_objects = Vec::new();
     let mut unreadable_temp = false;
 
     for (statement_index, statement) in statements.iter().enumerate() {
         if let Some(name) = exact_dropped_table(statement) {
-            // Rollbacks can bring a temp shadow back without the scanner
-            // seeing it, so an unqualified name once used by a temp table
-            // never resolves to main here.
-            let table = if name.parts.len() == 1
-                && (unreadable_temp || temp_leaves.contains(name.leaf()))
-            {
+            let table = if name.parts.len() == 1 && (unreadable_temp || temps.shadowed(&name)) {
                 ("temp".to_string(), name.leaf().to_string())
             } else {
                 owned(temps.resolve(&name))
             };
-            report.dropped_tables.push(DroppedTable {
+            report.table_changes.push(TableChange {
                 statement_index,
                 table,
+                kind: TableChangeKind::Dropped,
                 undone_at: None,
             });
-            journal.record(OpenDrop::Table(report.dropped_tables.len() - 1));
+            journal.record(Undoable::TableChange(report.table_changes.len() - 1));
         } else if let Some((from, to)) = renamed_table(statement) {
-            let from = owned(temps.resolve(&from));
-            let to = (from.0.clone(), to.leaf().to_string());
-            report.renamed_tables.push(RenamedTable {
+            report.table_changes.push(TableChange {
                 statement_index,
+                table: owned(temps.resolve(&from)),
+                kind: TableChangeKind::RenamedTo {
+                    name: to.leaf().to_string(),
+                    unqualified: from.parts.len() == 1,
+                    shadowed: unreadable_temp || temps.shadowed(&from),
+                },
+                undone_at: None,
+            });
+            journal.record(Undoable::TableChange(report.table_changes.len() - 1));
+        } else if let Some((table, from, to)) = renamed_column(statement) {
+            report.column_renames.push(ColumnRename {
+                statement_index,
+                table_parts: table.parts,
                 from,
                 to,
             });
@@ -198,7 +230,6 @@ pub fn scan_sql(sql: &str) -> ScanReport {
             journal.apply(command, statement_index, &mut report);
         }
         temps.apply(statement);
-        temp_leaves.extend(temps.names.iter().cloned());
         let tokens = &statement.tokens;
         if token_is(tokens, 0, "CREATE")
             && (token_is(tokens, 1, "TEMP") || token_is(tokens, 1, "TEMPORARY"))
@@ -206,29 +237,49 @@ pub fn scan_sql(sql: &str) -> ScanReport {
         {
             unreadable_temp = true;
         }
-        if let Some(schema_object) = created_schema_object(statement, statement_index) {
+        if let Some(schema_object) = created_schema_object(statement, statement_index, &temps) {
+            if schema_object.identity.0 == "temp" {
+                temp_objects.push((schema_object.kind, schema_object.identity.1.clone()));
+            }
             report.schema_objects.push(schema_object);
+            journal.record(Undoable::ObjectCreation(report.schema_objects.len() - 1));
         }
-        if let Some(schema_object) = dropped_schema_object(statement, statement_index) {
-            report.dropped_schema_objects.push(schema_object);
-            journal.record(OpenDrop::SchemaObject(
+        if let Some((kind, name)) = dropped_schema_object(statement) {
+            // As with tables, a temp index or trigger that a rollback brought
+            // back would be the one an unqualified DROP removes.
+            let schema = match name.parts.as_slice() {
+                [schema, _] => schema.clone(),
+                _ if temp_objects.contains(&(kind, name.leaf().to_string())) => "temp".to_string(),
+                _ => "main".to_string(),
+            };
+            report.dropped_schema_objects.push(DroppedSchemaObject {
+                kind,
+                name: name.canonical(),
+                line: statement.line,
+                statement_index,
+                identity: (schema, name.leaf().to_string()),
+                undone_at: None,
+            });
+            journal.record(Undoable::ObjectDrop(
                 report.dropped_schema_objects.len() - 1,
             ));
         }
-        report
-            .delete_action_references
-            .extend(delete_action_references(statement, statement_index));
-        if let Some(enabled) = foreign_keys_setting(statement) {
-            if journal.in_transaction {
-                report
-                    .foreign_keys_pragmas_in_transactions
-                    .push(ForeignKeysPragmaInTransaction {
-                        line: statement.line,
-                        requested_enabled: enabled,
-                    });
-            } else {
-                foreign_keys_enabled = Some(enabled);
-            }
+        for reference in delete_action_references(statement, statement_index) {
+            report.delete_action_references.push(reference);
+            journal.record(Undoable::Reference(
+                report.delete_action_references.len() - 1,
+            ));
+        }
+        match foreign_keys_assignment(statement) {
+            Some(Some(enabled)) if journal.in_transaction => report
+                .foreign_keys_pragmas_in_transactions
+                .push(ForeignKeysPragmaInTransaction {
+                    line: statement.line,
+                    requested_enabled: enabled,
+                }),
+            // A value the scanner cannot read leaves the state unknown.
+            Some(value) if !journal.in_transaction => foreign_keys_enabled = value,
+            _ => {}
         }
         foreign_key_states.push(foreign_keys_enabled);
     }
@@ -238,109 +289,158 @@ pub fn scan_sql(sql: &str) -> ScanReport {
     for (statement_index, (statement, foreign_keys_enabled)) in
         statements.iter().zip(foreign_key_states).enumerate()
     {
+        let dropped = dropped_table(statement).map(|name| {
+            // An unqualified name a temp table has used may mean either table.
+            let table = (!temp_tables.shadowed(&name)).then(|| owned(temp_tables.resolve(&name)));
+            (name, table)
+        });
         temp_tables.apply(statement);
+        let completed = (statement.line, statement_index);
+
         if let Some((created, _)) = created_table(statement) {
-            // Recreating the dropped original under its own name is the
+            // Creating a dropped source again under its own name is the
             // replacement step of the copy-out/copy-back shape Rails emits.
             // Every holding table copied from it stays a candidate; the
             // copy-back decides which one was the rebuild.
-            let mut recreated = false;
-            for candidate in candidates.iter_mut().filter(|candidate| {
-                candidate.stage == CandidateStage::Dropped
-                    && candidate
-                        .original_table
-                        .as_ref()
-                        .is_some_and(|name| name.matches(&created))
-            }) {
-                candidate.replacement_line = statement.line;
-                candidate.replacement_statement_index = statement_index;
-                candidate.replacement_columns = table_columns(statement);
-                candidate.stage = CandidateStage::Recreated;
-                recreated = true;
+            let columns = table_columns(statement);
+            for source in candidates
+                .iter_mut()
+                .flat_map(|candidate| candidate.sources.iter_mut())
+                .filter(|source| !source.drops.is_empty() && source.table.matches(&created))
+            {
+                source.creations.push(Creation {
+                    line: statement.line,
+                    statement_index,
+                    columns: columns.clone(),
+                });
             }
-            if recreated {
+
+            // IF NOT EXISTS does nothing to a replacement that is there.
+            let if_not_exists =
+                token_is(&statement.tokens, 2, "IF") || token_is(&statement.tokens, 3, "IF");
+            if if_not_exists
+                && candidates
+                    .iter()
+                    .any(|candidate| candidate.temporary_table.matches(&created))
+            {
                 continue;
             }
-
-            // A replacement table with the same identity supersedes an older,
-            // incomplete candidate. Later steps must not finish the old create.
-            candidates.retain(|candidate| !candidate.temporary_table.matches(&created));
-            candidates.push(RebuildCandidate::new(
-                created,
-                statement.line,
-                table_columns(statement),
-            ));
+            // A new table with the name of an older, incomplete replacement
+            // supersedes it, unless that one holds the rows of this table.
+            candidates.retain(|candidate| {
+                !candidate.temporary_table.matches(&created)
+                    || candidate.sources.iter().any(|source| {
+                        source
+                            .creations
+                            .last()
+                            .is_some_and(|creation| creation.statement_index == statement_index)
+                    })
+            });
+            candidates.push(RebuildCandidate {
+                schema: created_identity(statement, &created).0,
+                temporary_table: created,
+                create_line: statement.line,
+                columns,
+                sources: Vec::new(),
+            });
             continue;
         }
 
-        if let Some((target, source)) = copied_table(statement)
-            && let Some(index) = candidates.iter().rposition(|candidate| {
-                candidate.stage == CandidateStage::Recreated
-                    && candidate.temporary_table.matches(&source)
-                    && candidate
-                        .original_table
-                        .as_ref()
-                        .is_some_and(|name| name.matches(&target))
-            })
-        {
-            let candidate = candidates.remove(index);
-            forget_siblings(&mut candidates, candidate.drop_statement_index);
-            report
-                .rebuilds
-                .push(candidate.finish(RebuildKind::Recreate));
-            continue;
-        }
+        if let Some((target, sources)) = copied_table(statement) {
+            let target_table = temp_tables.resolve(&target);
+            let copied_back = candidates.iter().rev().find_map(|candidate| {
+                if !sources
+                    .iter()
+                    .any(|source| candidate.temporary_table.matches(source))
+                {
+                    return None;
+                }
+                let rebuilds = candidate.rebuilds(
+                    &report,
+                    RebuildKind::Recreate,
+                    &target,
+                    target_table,
+                    completed,
+                );
+                // A temp table that held the rows is scratch space: when it
+                // is dropped, created and filled again for the next rebuild,
+                // that is not a rebuild of the temp table.
+                let scratch_table =
+                    (candidate.schema == "temp").then(|| candidate.temporary_table.clone());
+                (!rebuilds.is_empty()).then_some((scratch_table, rebuilds))
+            });
+            let (scratch_table, rebuilds) = copied_back.unwrap_or_default();
+            for rebuild in rebuilds {
+                forget_siblings(&mut candidates, rebuild.drop_statement_index);
+                report.rebuilds.push(rebuild);
+            }
 
-        if let Some((temporary_table, original_table)) = copied_table(statement) {
             // `t` and `main.t` are one table unless a temp `t` shadows it.
-            if temp_tables.resolve(&temporary_table) == temp_tables.resolve(&original_table) {
-                continue;
-            }
-            if let Some(candidate) = candidates.iter_mut().rev().find(|candidate| {
-                candidate.stage == CandidateStage::Created
-                    && candidate.temporary_table.matches(&temporary_table)
-            }) {
-                candidate.original_table = Some(original_table);
-                candidate.copy_line = statement.line;
-                candidate.stage = CandidateStage::Copied;
+            let copies: Vec<_> = sources
+                .into_iter()
+                .filter(|source| temp_tables.resolve(source) != target_table)
+                .map(|table| CopySource {
+                    replaces_only: scratch_table
+                        .as_ref()
+                        .is_some_and(|scratch| scratch.matches(&table)),
+                    table,
+                    copy_line: statement.line,
+                    drops: Vec::new(),
+                    creations: Vec::new(),
+                })
+                .collect();
+            // Any table the rows come from may be the one being rebuilt; the
+            // drop and the rename or copy-back decide.
+            if let Some(candidate) = candidates
+                .iter_mut()
+                .rev()
+                .find(|candidate| candidate.temporary_table.matches(&target))
+            {
+                candidate.sources.extend(copies);
             }
             continue;
         }
 
-        if let Some(original_table) = dropped_table(statement) {
+        if let Some((dropped, table)) = dropped {
             // A backup copy of the same table must not consume the drop that
-            // belongs to the real rebuild, so every copy advances; the rename
-            // or copy-back completes only the one that replaces the original.
-            for candidate in candidates.iter_mut().filter(|candidate| {
-                candidate.stage == CandidateStage::Copied
-                    && candidate
-                        .original_table
-                        .as_ref()
-                        .is_some_and(|name| name.matches(&original_table))
-            }) {
-                candidate.drop_line = statement.line;
-                candidate.drop_statement_index = statement_index;
-                candidate.foreign_keys_enabled_at_drop = foreign_keys_enabled;
-                candidate.stage = CandidateStage::Dropped;
+            // belongs to the real rebuild, so every copy records it; the
+            // rename or copy-back completes only the one that replaces the
+            // original.
+            for source in candidates
+                .iter_mut()
+                .flat_map(|candidate| candidate.sources.iter_mut())
+                .filter(|source| source.table.matches(&dropped))
+            {
+                source.drops.push(DropPoint {
+                    line: statement.line,
+                    statement_index,
+                    foreign_keys_enabled,
+                    table: table.clone(),
+                });
             }
             continue;
         }
 
-        if let Some((temporary_table, original_table)) = renamed_table(statement)
-            && let Some(index) = candidates.iter().rposition(|candidate| {
-                candidate.stage == CandidateStage::Dropped
-                    && candidate.temporary_table.matches(&temporary_table)
-                    && candidate
-                        .original_table
-                        .as_ref()
-                        .is_some_and(|name| name.matches(&original_table))
-            })
-        {
-            let mut candidate = candidates.remove(index);
-            forget_siblings(&mut candidates, candidate.drop_statement_index);
-            candidate.replacement_line = statement.line;
-            candidate.replacement_statement_index = statement_index;
-            report.rebuilds.push(candidate.finish(RebuildKind::Rename));
+        if let Some((temporary_table, original_table)) = renamed_table(statement) {
+            // The candidate stays: if a rollback undoes the rename, the same
+            // replacement can go through the steps again.
+            let renamed = candidates.iter().rev().find_map(|candidate| {
+                if !candidate.temporary_table.matches(&temporary_table) {
+                    return None;
+                }
+                let rebuilds = candidate.rebuilds(
+                    &report,
+                    RebuildKind::Rename,
+                    &original_table,
+                    (candidate.schema.as_str(), original_table.leaf()),
+                    completed,
+                );
+                (!rebuilds.is_empty()).then_some(rebuilds)
+            });
+            for rebuild in renamed.into_iter().flatten() {
+                forget_siblings(&mut candidates, rebuild.drop_statement_index);
+                report.rebuilds.push(rebuild);
+            }
         }
     }
 
@@ -351,7 +451,7 @@ pub fn scan_sql(sql: &str) -> ScanReport {
 enum TokenKind {
     Word(String),
     QuotedIdentifier(String),
-    StringLiteral,
+    StringLiteral(String),
     Symbol(char),
 }
 
@@ -446,7 +546,9 @@ fn lex(sql: &str) -> Vec<Token> {
     while let Some(ch) = chars.next() {
         match ch {
             '\n' => line += 1,
-            ch if ch.is_whitespace() => {}
+            // Only ASCII whitespace and a byte-order mark separate tokens in
+            // SQLite.
+            ch if ch.is_ascii_whitespace() || ch == '\u{feff}' => {}
             '-' if chars.peek() == Some(&'-') => {
                 chars.next();
                 for comment_ch in chars.by_ref() {
@@ -471,15 +573,15 @@ fn lex(sql: &str) -> Vec<Token> {
             }
             '\'' => {
                 let start_line = line;
-                skip_quoted(&mut chars, '\'', &mut line);
+                let text = read_quoted(&mut chars, '\'', &mut line);
                 result.push(Token {
-                    kind: TokenKind::StringLiteral,
+                    kind: TokenKind::StringLiteral(text),
                     line: start_line,
                 });
             }
             '"' | '`' => {
                 let start_line = line;
-                let identifier = read_quoted_identifier(&mut chars, ch, &mut line);
+                let identifier = read_quoted(&mut chars, ch, &mut line);
                 result.push(Token {
                     kind: TokenKind::QuotedIdentifier(identifier),
                     line: start_line,
@@ -487,7 +589,7 @@ fn lex(sql: &str) -> Vec<Token> {
             }
             '[' => {
                 let start_line = line;
-                let identifier = read_quoted_identifier(&mut chars, ']', &mut line);
+                let identifier = read_quoted(&mut chars, ']', &mut line);
                 result.push(Token {
                     kind: TokenKind::QuotedIdentifier(identifier),
                     line: start_line,
@@ -514,10 +616,11 @@ fn lex(sql: &str) -> Vec<Token> {
     result
 }
 
-fn skip_quoted<I>(chars: &mut std::iter::Peekable<I>, delimiter: char, line: &mut usize)
+fn read_quoted<I>(chars: &mut std::iter::Peekable<I>, delimiter: char, line: &mut usize) -> String
 where
     I: Iterator<Item = char>,
 {
+    let mut text = String::new();
     while let Some(ch) = chars.next() {
         if ch == '\n' {
             *line += 1;
@@ -525,42 +628,20 @@ where
         if ch == delimiter {
             if chars.peek() == Some(&delimiter) {
                 chars.next();
-            } else {
-                break;
-            }
-        }
-    }
-}
-
-fn read_quoted_identifier<I>(
-    chars: &mut std::iter::Peekable<I>,
-    delimiter: char,
-    line: &mut usize,
-) -> String
-where
-    I: Iterator<Item = char>,
-{
-    let mut identifier = String::new();
-    while let Some(ch) = chars.next() {
-        if ch == '\n' {
-            *line += 1;
-        }
-        if ch == delimiter {
-            if chars.peek() == Some(&delimiter) {
-                chars.next();
-                identifier.push(delimiter);
+                text.push(delimiter);
             } else {
                 break;
             }
         } else {
-            identifier.push(ch);
+            text.push(ch);
         }
     }
-    identifier
+    text
 }
 
 fn is_word_character(ch: char) -> bool {
-    ch.is_alphanumeric() || matches!(ch, '_' | '$')
+    // SQLite takes every non-ASCII character as part of a name.
+    ch.is_alphanumeric() || matches!(ch, '_' | '$') || !ch.is_ascii()
 }
 
 fn keyword(token: &Token, expected: &str) -> bool {
@@ -610,22 +691,21 @@ fn parse_name(tokens: &[Token], start: usize) -> Option<(Name, usize)> {
     Some((Name { parts }, index))
 }
 
+/// SQLite reads a string literal as a name where the grammar expects one.
 fn identifier(token: &Token) -> Option<String> {
     match &token.kind {
-        TokenKind::Word(value) | TokenKind::QuotedIdentifier(value) => {
-            Some(value.to_ascii_lowercase())
-        }
-        TokenKind::StringLiteral | TokenKind::Symbol(_) => None,
+        TokenKind::Word(value)
+        | TokenKind::QuotedIdentifier(value)
+        | TokenKind::StringLiteral(value) => Some(value.to_ascii_lowercase()),
+        TokenKind::Symbol(_) => None,
     }
 }
 
-/// A transaction-control statement. The foreign-key pragma check and the drop
-/// journal both read it from here, so they agree on every spelling.
+/// A parsed transaction-control statement.
 #[derive(Debug, PartialEq, Eq)]
 enum TransactionCommand {
     Begin,
-    /// `None` when the name is a string literal, which the scanner does not
-    /// compare with identifiers.
+    /// `None` when the name cannot be read.
     Savepoint(Option<Name>),
     Commit,
     Rollback,
@@ -684,22 +764,24 @@ fn after_transaction_name(tokens: &[Token], at: usize) -> usize {
     }
 }
 
-/// A drop made in the open transaction, by its position in the report.
+/// A change made in the open transaction, by its position in the report.
 #[derive(Debug, Clone, Copy)]
-enum OpenDrop {
-    Table(usize),
-    SchemaObject(usize),
+enum Undoable {
+    TableChange(usize),
+    ObjectCreation(usize),
+    ObjectDrop(usize),
+    Reference(usize),
 }
 
-/// Follows the open transaction and which drops a later `ROLLBACK` undoes. A
-/// drop stays in effect unless the whole transaction rolls back, or the input
-/// rolls back to a savepoint that was set before the drop. A rollback it
-/// cannot read undoes every open drop, and an unreadable savepoint name stops
-/// RELEASE or ROLLBACK TO from resolving past it, so unclear input keeps the
-/// warning.
+/// Follows the open transaction and which changes a later `ROLLBACK` undoes:
+/// all of them, or with `ROLLBACK TO` those made after the savepoint was set.
+/// SQLite rejects a rollback whose target is not an open savepoint; the
+/// journal still counts it as undoing every open drop, so a name it misreads
+/// cannot hide a dependent table or a lost index. A savepoint whose name it
+/// cannot read stops RELEASE and ROLLBACK TO from resolving past it.
 #[derive(Debug, Default)]
 struct TransactionJournal {
-    open: Vec<OpenDrop>,
+    open: Vec<Undoable>,
     /// Open savepoints (name, when readable) and the statement that set each.
     savepoints: Vec<(Option<Name>, usize)>,
     in_transaction: bool,
@@ -707,9 +789,9 @@ struct TransactionJournal {
 }
 
 impl TransactionJournal {
-    fn record(&mut self, drop: OpenDrop) {
+    fn record(&mut self, change: Undoable) {
         if self.in_transaction {
-            self.open.push(drop);
+            self.open.push(change);
         }
     }
 
@@ -730,7 +812,7 @@ impl TransactionJournal {
             }
             TransactionCommand::Commit => self.close(),
             TransactionCommand::Rollback => {
-                self.undo_open(report, index, None);
+                self.undo_open(report, index, Rollback::All);
                 self.close();
             }
             TransactionCommand::RollbackTo(name) => {
@@ -741,15 +823,15 @@ impl TransactionJournal {
                     Some(position) => {
                         let since = self.savepoints[position].1;
                         self.savepoints.truncate(position + 1);
-                        self.undo_open(report, index, Some(since));
+                        self.undo_open(report, index, Rollback::Since(since));
                     }
-                    None => self.undo_open(report, index, None),
+                    None => self.undo_open(report, index, Rollback::Unresolved),
                 }
             }
             TransactionCommand::Release(name) => {
                 let position = name.and_then(|name| self.savepoint(&name));
                 if position.is_some_and(|position| !self.unambiguous_from(position)) {
-                    self.undo_open(report, index, None);
+                    self.undo_open(report, index, Rollback::Unresolved);
                 } else if let Some(position) = position {
                     self.savepoints.truncate(position);
                     if self.savepoints.is_empty() && !self.explicit {
@@ -774,19 +856,35 @@ impl TransactionJournal {
             .all(|(name, _)| name.is_some())
     }
 
-    fn undo_open(&mut self, report: &mut ScanReport, index: usize, since: Option<usize>) {
-        self.open.retain(|drop| {
-            let (dropped_at, undone_at) = match *drop {
-                OpenDrop::Table(position) => {
-                    let table = &mut report.dropped_tables[position];
-                    (table.statement_index, &mut table.undone_at)
+    fn undo_open(&mut self, report: &mut ScanReport, index: usize, rollback: Rollback) {
+        self.open.retain(|change| {
+            let (changed_at, undone_at, is_drop) = match *change {
+                Undoable::TableChange(position) => {
+                    let table = &mut report.table_changes[position];
+                    (
+                        table.statement_index,
+                        &mut table.undone_at,
+                        table.kind == TableChangeKind::Dropped,
+                    )
                 }
-                OpenDrop::SchemaObject(position) => {
+                Undoable::ObjectCreation(position) => {
+                    let object = &mut report.schema_objects[position];
+                    (object.statement_index, &mut object.undone_at, false)
+                }
+                Undoable::ObjectDrop(position) => {
                     let object = &mut report.dropped_schema_objects[position];
-                    (object.statement_index, &mut object.undone_at)
+                    (object.statement_index, &mut object.undone_at, true)
+                }
+                Undoable::Reference(position) => {
+                    let reference = &mut report.delete_action_references[position];
+                    (reference.statement_index, &mut reference.undone_at, false)
                 }
             };
-            let undone = since.is_none_or(|since| dropped_at > since);
+            let undone = match rollback {
+                Rollback::All => true,
+                Rollback::Since(since) => changed_at > since,
+                Rollback::Unresolved => is_drop,
+            };
             if undone {
                 *undone_at = Some(index);
             }
@@ -802,7 +900,19 @@ impl TransactionJournal {
     }
 }
 
-fn foreign_keys_setting(statement: &Statement) -> Option<bool> {
+#[derive(Debug, Clone, Copy)]
+enum Rollback {
+    All,
+    /// To a savepoint set by the statement at this index.
+    Since(usize),
+    /// `ROLLBACK TO` or `RELEASE` of a target the journal cannot place.
+    Unresolved,
+}
+
+/// The value a `PRAGMA foreign_keys` assignment asks for: `None` for other
+/// statements and for the query form, `Some(None)` when the value cannot be
+/// read.
+fn foreign_keys_assignment(statement: &Statement) -> Option<Option<bool>> {
     let tokens = &statement.tokens;
     if !token_is(tokens, 0, "PRAGMA") {
         return None;
@@ -811,36 +921,34 @@ fn foreign_keys_setting(statement: &Statement) -> Option<bool> {
     if name.leaf() != "foreign_keys" || name.parts.len() > 2 {
         return None;
     }
-    let has_equals_assignment = symbol_is(tokens, index, '=') && tokens.len() == index + 2;
-    let has_parenthesized_assignment = symbol_is(tokens, index, '(')
-        && symbol_is(tokens, index + 2, ')')
-        && tokens.len() == index + 3;
-    if !has_equals_assignment && !has_parenthesized_assignment {
+    let parenthesized = symbol_is(tokens, index, '(');
+    if !parenthesized && !symbol_is(tokens, index, '=') {
         return None;
     }
-    let value = tokens.get(index + 1)?;
-    if keyword(value, "OFF")
-        || keyword(value, "FALSE")
-        || keyword(value, "NO")
-        || numeric_pragma_value(value) == Some(false)
-    {
-        Some(false)
-    } else if keyword(value, "ON")
-        || keyword(value, "TRUE")
-        || keyword(value, "YES")
-        || numeric_pragma_value(value) == Some(true)
-    {
-        Some(true)
-    } else {
-        None
+    let mut value_at = index + 1;
+    if tokens.len() <= value_at || symbol_is(tokens, value_at, ')') {
+        return None;
     }
-}
-
-fn numeric_pragma_value(token: &Token) -> Option<bool> {
-    match &token.kind {
-        TokenKind::Word(word) => word.parse::<i64>().ok().map(|value| value != 0),
-        _ => None,
+    let negative = symbol_is(tokens, value_at, '-');
+    let signed = negative || symbol_is(tokens, value_at, '+');
+    value_at += usize::from(signed);
+    let end = value_at + 1 + usize::from(parenthesized);
+    if tokens.len() != end || (parenthesized && !symbol_is(tokens, value_at + 1, ')')) {
+        return Some(None);
     }
+    // The value may be bare or quoted: `ON`, `'ON'` and `"ON"` are the same.
+    let Some(value) = tokens.get(value_at).and_then(identifier) else {
+        return Some(None);
+    };
+    Some(match value.as_str() {
+        "off" | "false" | "no" if !signed => Some(false),
+        "on" | "true" | "yes" if !signed => Some(true),
+        // SQLite reads a negative number as off.
+        number => number
+            .parse::<i64>()
+            .ok()
+            .map(|value| value != 0 && !negative),
+    })
 }
 
 /// Temporary tables that exist at a point in the input, so an unqualified name
@@ -848,19 +956,24 @@ fn numeric_pragma_value(token: &Token) -> Option<bool> {
 #[derive(Default)]
 struct TempTables {
     names: Vec<String>,
+    /// Every name a temp table has had, including tables since dropped.
+    ever: std::collections::HashSet<String>,
 }
 
 impl TempTables {
-    /// Updates the set for the statement. Called before the statement's own
-    /// copy is resolved; only CREATE, DROP and RENAME change it.
+    /// Called before the statement's own copy is resolved; only CREATE, DROP
+    /// and RENAME change the set.
     fn apply(&mut self, statement: &Statement) {
         let tokens = &statement.tokens;
         if let Some((name, _)) = created_table(statement) {
             let temporary = token_is(tokens, 1, "TEMP")
                 || token_is(tokens, 1, "TEMPORARY")
                 || name.parts.first().is_some_and(|schema| schema == "temp");
-            if temporary && !self.names.iter().any(|leaf| leaf == name.leaf()) {
-                self.names.push(name.leaf().to_string());
+            if temporary {
+                self.ever.insert(name.leaf().to_string());
+                if !self.names.iter().any(|leaf| leaf == name.leaf()) {
+                    self.names.push(name.leaf().to_string());
+                }
             }
         } else if let Some(name) = dropped_table(statement)
             && self.resolve(&name).0 == "temp"
@@ -871,7 +984,15 @@ impl TempTables {
         {
             self.names.retain(|leaf| leaf != from.leaf());
             self.names.push(to.leaf().to_string());
+            self.ever.insert(to.leaf().to_string());
         }
+    }
+
+    /// A rollback can bring a temp table back without the scanner seeing it,
+    /// so an unqualified name a temp table once had is not known to mean the
+    /// main table.
+    fn shadowed(&self, name: &Name) -> bool {
+        name.parts.len() == 1 && self.ever.contains(name.leaf())
     }
 
     fn resolve<'a>(&self, name: &'a Name) -> (&'a str, &'a str) {
@@ -947,8 +1068,8 @@ fn table_columns(statement: &Statement) -> Option<Vec<String>> {
     if !symbol_is(tokens, opening_parenthesis, '(') {
         return None;
     }
-    // A declaration whose name cannot be read (a single-quoted name) makes the
-    // whole list unknown rather than silently shorter.
+    // A declaration whose name cannot be read makes the whole list unknown
+    // rather than silently shorter.
     table_definition_ranges(tokens, opening_parenthesis)
         .into_iter()
         .filter(|(start, _)| {
@@ -960,12 +1081,35 @@ fn table_columns(statement: &Statement) -> Option<Vec<String>> {
         .collect()
 }
 
-fn created_schema_object(statement: &Statement, statement_index: usize) -> Option<SchemaObject> {
-    created_index(statement, statement_index)
-        .or_else(|| created_trigger(statement, statement_index))
+fn created_schema_object(
+    statement: &Statement,
+    statement_index: usize,
+    temps: &TempTables,
+) -> Option<SchemaObject> {
+    created_index(statement, statement_index, temps)
+        .or_else(|| created_trigger(statement, statement_index, temps))
 }
 
-fn created_index(statement: &Statement, statement_index: usize) -> Option<SchemaObject> {
+/// An index or a trigger without a schema of its own lives in its table's.
+fn object_identity(
+    name: &Name,
+    temporary: bool,
+    table: &Name,
+    temps: &TempTables,
+) -> (String, String) {
+    let schema = match name.parts.as_slice() {
+        [schema, _] => schema.as_str(),
+        _ if temporary => "temp",
+        _ => temps.resolve(table).0,
+    };
+    (schema.to_string(), name.leaf().to_string())
+}
+
+fn created_index(
+    statement: &Statement,
+    statement_index: usize,
+    temps: &TempTables,
+) -> Option<SchemaObject> {
     let tokens = &statement.tokens;
     if !token_is(tokens, 0, "CREATE") {
         return None;
@@ -978,10 +1122,10 @@ fn created_index(statement: &Statement, statement_index: usize) -> Option<Schema
         return None;
     }
     index += 1;
-    if token_is(tokens, index, "IF")
+    let if_not_exists = token_is(tokens, index, "IF")
         && token_is(tokens, index + 1, "NOT")
-        && token_is(tokens, index + 2, "EXISTS")
-    {
+        && token_is(tokens, index + 2, "EXISTS");
+    if if_not_exists {
         index += 3;
     }
     let (name, index) = parse_name(tokens, index)?;
@@ -998,29 +1142,39 @@ fn created_index(statement: &Statement, statement_index: usize) -> Option<Schema
         table: table.canonical(),
         line: statement.line,
         statement_index,
-        name_parts: name.parts,
+        identity: object_identity(&name, false, &table, temps),
+        table_shadowed: name.parts.len() == 1
+            && temps.shadowed(&table)
+            && temps.resolve(&table).0 != "temp",
+        if_not_exists,
         table_parts: table.parts,
         columns,
+        undone_at: None,
     })
 }
 
-fn created_trigger(statement: &Statement, statement_index: usize) -> Option<SchemaObject> {
+fn created_trigger(
+    statement: &Statement,
+    statement_index: usize,
+    temps: &TempTables,
+) -> Option<SchemaObject> {
     let tokens = &statement.tokens;
     if !token_is(tokens, 0, "CREATE") {
         return None;
     }
     let mut index = 1;
-    if token_is(tokens, index, "TEMP") || token_is(tokens, index, "TEMPORARY") {
+    let temporary = token_is(tokens, index, "TEMP") || token_is(tokens, index, "TEMPORARY");
+    if temporary {
         index += 1;
     }
     if !token_is(tokens, index, "TRIGGER") {
         return None;
     }
     index += 1;
-    if token_is(tokens, index, "IF")
+    let if_not_exists = token_is(tokens, index, "IF")
         && token_is(tokens, index + 1, "NOT")
-        && token_is(tokens, index + 2, "EXISTS")
-    {
+        && token_is(tokens, index + 2, "EXISTS");
+    if if_not_exists {
         index += 3;
     }
     let (name, index) = parse_name(tokens, index)?;
@@ -1041,16 +1195,19 @@ fn created_trigger(statement: &Statement, statement_index: usize) -> Option<Sche
         table: table.canonical(),
         line: statement.line,
         statement_index,
-        name_parts: name.parts,
+        identity: object_identity(&name, temporary, &table, temps),
+        table_shadowed: name.parts.len() == 1
+            && !temporary
+            && temps.shadowed(&table)
+            && temps.resolve(&table).0 != "temp",
+        if_not_exists,
         table_parts: table.parts,
         columns: None,
+        undone_at: None,
     })
 }
 
-fn dropped_schema_object(
-    statement: &Statement,
-    statement_index: usize,
-) -> Option<DroppedSchemaObject> {
+fn dropped_schema_object(statement: &Statement) -> Option<(SchemaObjectKind, Name)> {
     let tokens = &statement.tokens;
     if !token_is(tokens, 0, "DROP") {
         return None;
@@ -1067,17 +1224,7 @@ fn dropped_schema_object(
         index += 2;
     }
     let (name, end) = parse_name(tokens, index)?;
-    if end != tokens.len() {
-        return None;
-    }
-    Some(DroppedSchemaObject {
-        kind,
-        name: name.canonical(),
-        line: statement.line,
-        statement_index,
-        name_parts: name.parts,
-        undone_at: None,
-    })
+    (end == tokens.len()).then_some((kind, name))
 }
 
 fn delete_action_references(
@@ -1092,33 +1239,32 @@ fn delete_action_references(
         return Vec::new();
     }
 
-    table_definition_ranges(tokens, opening_parenthesis)
-        .into_iter()
-        .filter_map(|(start, end)| {
-            let reference_index =
-                (start..end).find(|index| token_is(tokens, *index, "REFERENCES"))?;
-            let (referenced_table, mut index) = parse_name(tokens, reference_index + 1)?;
+    let mut references = Vec::new();
+    for (start, end) in table_definition_ranges(tokens, opening_parenthesis) {
+        // A column can carry several REFERENCES clauses; the actions of each
+        // run up to the next one.
+        let clauses: Vec<_> = (start..end)
+            .filter(|index| token_is(tokens, *index, "REFERENCES"))
+            .collect();
+        for (position, &reference_index) in clauses.iter().enumerate() {
+            let end = clauses.get(position + 1).copied().unwrap_or(end);
+            let Some((referenced_table, mut index)) = parse_name(tokens, reference_index + 1)
+            else {
+                continue;
+            };
             if symbol_is(tokens, index, '(') {
-                index = after_balanced_parentheses(tokens, index)?;
+                let Some(after_columns) = after_balanced_parentheses(tokens, index) else {
+                    continue;
+                };
+                index = after_columns;
             }
-            let action = (index..end).find_map(|index| {
-                if !token_is(tokens, index, "ON") || !token_is(tokens, index + 1, "DELETE") {
-                    return None;
-                }
-                if token_is(tokens, index + 2, "CASCADE") {
-                    Some(DeleteAction::Cascade)
-                } else if token_is(tokens, index + 2, "SET") && token_is(tokens, index + 3, "NULL")
-                {
-                    Some(DeleteAction::SetNull)
-                } else if token_is(tokens, index + 2, "SET")
-                    && token_is(tokens, index + 3, "DEFAULT")
-                {
-                    Some(DeleteAction::SetDefault)
-                } else {
-                    None
-                }
-            })?;
-            (!dependent_table.matches(&referenced_table)).then(|| DeleteActionReference {
+            let Some(action) = delete_action(tokens, index, end) else {
+                continue;
+            };
+            if dependent_table.matches(&referenced_table) {
+                continue;
+            }
+            references.push(DeleteActionReference {
                 dependent_table: dependent_table.canonical(),
                 referenced_table: referenced_table.canonical(),
                 action,
@@ -1126,9 +1272,28 @@ fn delete_action_references(
                 statement_index,
                 dependent_identity: created_identity(statement, &dependent_table),
                 referenced_table_parts: referenced_table.parts,
-            })
-        })
-        .collect()
+                undone_at: None,
+            });
+        }
+    }
+    references
+}
+
+fn delete_action(tokens: &[Token], start: usize, end: usize) -> Option<DeleteAction> {
+    (start..end).find_map(|index| {
+        if !token_is(tokens, index, "ON") || !token_is(tokens, index + 1, "DELETE") {
+            return None;
+        }
+        if token_is(tokens, index + 2, "CASCADE") {
+            Some(DeleteAction::Cascade)
+        } else if token_is(tokens, index + 2, "SET") && token_is(tokens, index + 3, "NULL") {
+            Some(DeleteAction::SetNull)
+        } else if token_is(tokens, index + 2, "SET") && token_is(tokens, index + 3, "DEFAULT") {
+            Some(DeleteAction::SetDefault)
+        } else {
+            None
+        }
+    })
 }
 
 fn table_definition_ranges(tokens: &[Token], opening_parenthesis: usize) -> Vec<(usize, usize)> {
@@ -1161,16 +1326,22 @@ fn table_definition_ranges(tokens: &[Token], opening_parenthesis: usize) -> Vec<
     ranges
 }
 
-fn copied_table(statement: &Statement) -> Option<(Name, Name)> {
+/// The table an `INSERT ... SELECT` fills and every table its rows may come
+/// from: the names after FROM and JOIN, also in subqueries.
+fn copied_table(statement: &Statement) -> Option<(Name, Vec<Name>)> {
     let tokens = &statement.tokens;
-    if !token_is(tokens, 0, "INSERT") {
-        return None;
-    }
+    // `INSERT [OR resolution] INTO` or its alias `REPLACE INTO`.
     let mut index = 1;
-    if token_is(tokens, index, "OR")
-        && (token_is(tokens, index + 1, "IGNORE") || token_is(tokens, index + 1, "REPLACE"))
-    {
-        index += 2;
+    if token_is(tokens, 0, "INSERT") {
+        if token_is(tokens, index, "OR")
+            && ["ABORT", "FAIL", "IGNORE", "REPLACE", "ROLLBACK"]
+                .iter()
+                .any(|resolution| token_is(tokens, index + 1, resolution))
+        {
+            index += 2;
+        }
+    } else if !token_is(tokens, 0, "REPLACE") {
+        return None;
     }
     if !token_is(tokens, index, "INTO") {
         return None;
@@ -1182,14 +1353,17 @@ fn copied_table(statement: &Statement) -> Option<(Name, Name)> {
     if !token_is(tokens, index, "SELECT") {
         return None;
     }
-    let from_index = tokens
-        .iter()
-        .enumerate()
-        .skip(index + 1)
-        .find(|(_, token)| keyword(token, "FROM"))?
-        .0;
-    let (source, _) = parse_name(tokens, from_index + 1)?;
-    Some((target, source))
+    let sources: Vec<_> = (index + 1..tokens.len())
+        .filter(|position| {
+            token_is(tokens, *position, "JOIN")
+                // Not the FROM of `IS [NOT] DISTINCT FROM`.
+                || (token_is(tokens, *position, "FROM")
+                    && !token_is(tokens, *position - 1, "DISTINCT"))
+        })
+        .filter_map(|position| parse_name(tokens, position + 1))
+        .map(|(source, _)| source)
+        .collect();
+    (!sources.is_empty()).then_some((target, sources))
 }
 
 fn after_balanced_parentheses(tokens: &[Token], start: usize) -> Option<usize> {
@@ -1207,7 +1381,8 @@ fn after_balanced_parentheses(tokens: &[Token], start: usize) -> Option<usize> {
     None
 }
 
-fn dropped_table(statement: &Statement) -> Option<Name> {
+/// The table a `DROP TABLE [IF EXISTS]` names and the position after it.
+fn drop_table_name(statement: &Statement) -> Option<(Name, usize)> {
     let tokens = &statement.tokens;
     if !token_is(tokens, 0, "DROP") || !token_is(tokens, 1, "TABLE") {
         return None;
@@ -1217,22 +1392,17 @@ fn dropped_table(statement: &Statement) -> Option<Name> {
     } else {
         2
     };
-    parse_name(tokens, index).map(|(name, _)| name)
+    parse_name(tokens, index)
+}
+
+fn dropped_table(statement: &Statement) -> Option<Name> {
+    drop_table_name(statement).map(|(name, _)| name)
 }
 
 /// A malformed drop fails in SQLite, so it must not hide a surviving child.
 fn exact_dropped_table(statement: &Statement) -> Option<Name> {
-    let tokens = &statement.tokens;
-    if !token_is(tokens, 0, "DROP") || !token_is(tokens, 1, "TABLE") {
-        return None;
-    }
-    let index = if token_is(tokens, 2, "IF") && token_is(tokens, 3, "EXISTS") {
-        4
-    } else {
-        2
-    };
-    let (name, end) = parse_name(tokens, index)?;
-    (end == tokens.len() && name.parts.len() <= 2).then_some(name)
+    let (name, end) = drop_table_name(statement)?;
+    (end == statement.tokens.len() && name.parts.len() <= 2).then_some(name)
 }
 
 fn owned((schema, table): (&str, &str)) -> (String, String) {
@@ -1264,75 +1434,188 @@ fn renamed_table(statement: &Statement) -> Option<(Name, Name)> {
     (end == tokens.len()).then_some((from, to))
 }
 
-/// Other copies taken before the same DROP describe the same destroyed table;
-/// once one of them completes the rebuild they must not report it again.
-fn forget_siblings(candidates: &mut Vec<RebuildCandidate>, drop_statement_index: usize) {
-    candidates.retain(|candidate| {
-        !matches!(
-            candidate.stage,
-            CandidateStage::Dropped | CandidateStage::Recreated
-        ) || candidate.drop_statement_index != drop_statement_index
-    });
+fn renamed_column(statement: &Statement) -> Option<(Name, String, String)> {
+    let tokens = &statement.tokens;
+    if !token_is(tokens, 0, "ALTER") || !token_is(tokens, 1, "TABLE") {
+        return None;
+    }
+    let (table, mut index) = parse_name(tokens, 2)?;
+    if !token_is(tokens, index, "RENAME") || token_is(tokens, index + 1, "TO") {
+        return None;
+    }
+    index += 1 + usize::from(token_is(tokens, index + 1, "COLUMN"));
+    let from = identifier(tokens.get(index)?)?;
+    if !token_is(tokens, index + 1, "TO") {
+        return None;
+    }
+    let to = identifier(tokens.get(index + 2)?)?;
+    Some((table, from, to))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CandidateStage {
-    Created,
-    Copied,
-    Dropped,
-    Recreated,
+/// Other copies taken before the same DROP describe the same destroyed table;
+/// once one of them completes the rebuild they must not report it again. The
+/// copies stay, in case the table is dropped again.
+fn forget_siblings(candidates: &mut [RebuildCandidate], drop_statement_index: usize) {
+    for source in candidates
+        .iter_mut()
+        .flat_map(|candidate| candidate.sources.iter_mut())
+    {
+        source
+            .drops
+            .retain(|drop| drop.statement_index != drop_statement_index);
+    }
+}
+
+/// A table whose rows a candidate received, and each place where the input
+/// dropped a table of that name or created one after such a drop.
+#[derive(Debug)]
+struct CopySource {
+    table: Name,
+    copy_line: usize,
+    drops: Vec<DropPoint>,
+    creations: Vec<Creation>,
+    /// A scratch table recorded at a copy-back: the candidate may replace it
+    /// by a rename, but is not rebuilt through it.
+    replaces_only: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DropPoint {
+    line: usize,
+    statement_index: usize,
+    foreign_keys_enabled: Option<bool>,
+    /// Schema and table the DROP resolved to, when that is certain.
+    table: Option<(String, String)>,
+}
+
+#[derive(Debug)]
+struct Creation {
+    line: usize,
+    statement_index: usize,
+    columns: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
 struct RebuildCandidate {
     temporary_table: Name,
-    original_table: Option<Name>,
+    schema: String,
     create_line: usize,
-    copy_line: usize,
-    drop_line: usize,
-    replacement_line: usize,
-    drop_statement_index: usize,
-    replacement_statement_index: usize,
-    foreign_keys_enabled_at_drop: Option<bool>,
-    replacement_columns: Option<Vec<String>>,
-    stage: CandidateStage,
+    columns: Option<Vec<String>>,
+    sources: Vec<CopySource>,
 }
 
 impl RebuildCandidate {
-    fn new(temporary_table: Name, create_line: usize, columns: Option<Vec<String>>) -> Self {
-        Self {
-            temporary_table,
-            replacement_columns: columns,
-            original_table: None,
-            create_line,
-            copy_line: 0,
-            drop_line: 0,
-            replacement_line: 0,
-            drop_statement_index: 0,
-            replacement_statement_index: 0,
-            foreign_keys_enabled_at_drop: None,
-            stage: CandidateStage::Created,
+    /// The rebuilds of `original` that the statement at `completed` (line,
+    /// index) finishes: one for every drop that may have destroyed that
+    /// table.
+    ///
+    /// A drop that a rollback had undone does not count, nor one that
+    /// resolved to another schema than `wanted` when a drop in that schema
+    /// is known, nor one that found no table: a second drop in the same
+    /// schema with no CREATE of the name in between. In the copy-back shape
+    /// the table must have been created again after the drop.
+    fn rebuilds(
+        &self,
+        report: &ScanReport,
+        kind: RebuildKind,
+        original: &Name,
+        wanted: (&str, &str),
+        completed: (usize, usize),
+    ) -> Vec<RebuildSequence> {
+        let undone = |drop: &DropPoint| {
+            report.table_changes.iter().any(|change| {
+                change.statement_index == drop.statement_index
+                    && change.undone_at.is_some_and(|undone| undone < completed.1)
+            })
+        };
+        let sources = || {
+            self.sources.iter().filter(|source| {
+                source.table.matches(original)
+                    && (kind == RebuildKind::Rename || !source.replaces_only)
+            })
+        };
+        let created_between = |from: usize, to: usize| {
+            sources().any(|source| {
+                source.creations.iter().any(|creation| {
+                    creation.statement_index > from && creation.statement_index < to
+                })
+            })
+        };
+        let mut drops: Vec<_> = sources()
+            .flat_map(|source| source.drops.iter().map(move |drop| (source, drop)))
+            .filter(|(_, drop)| {
+                drop.statement_index < completed.1
+                    && (kind == RebuildKind::Rename
+                        || created_between(drop.statement_index, completed.1))
+            })
+            .collect();
+        drops.sort_by_key(|(_, drop)| drop.statement_index);
+        drops.dedup_by_key(|(_, drop)| drop.statement_index);
+        if drops.iter().any(|(_, drop)| !undone(drop)) {
+            drops.retain(|(_, drop)| !undone(drop));
         }
+        let in_schema = |drop: &DropPoint| {
+            drop.table
+                .as_ref()
+                .is_none_or(|(schema, table)| (schema.as_str(), table.as_str()) == wanted)
+        };
+        if drops.iter().any(|(_, drop)| in_schema(drop)) {
+            drops.retain(|(_, drop)| in_schema(drop));
+        }
+        (0..drops.len())
+            .filter(|position| {
+                let drop = drops[*position].1;
+                *position == 0
+                    || drop.table.is_none()
+                    || drop.table != drops[*position - 1].1.table
+                    || created_between(drops[*position - 1].1.statement_index, drop.statement_index)
+            })
+            .map(|position| {
+                let (source, drop) = drops[position];
+                self.rebuild(kind, source, drop, completed)
+            })
+            .collect()
     }
 
-    fn finish(self, kind: RebuildKind) -> RebuildSequence {
-        let original = self
-            .original_table
-            .expect("a dropped candidate has an original table");
+    fn rebuild(
+        &self,
+        kind: RebuildKind,
+        source: &CopySource,
+        drop: &DropPoint,
+        completed: (usize, usize),
+    ) -> RebuildSequence {
+        // The table is back from the first CREATE after the drop. If later
+        // ones list other columns, the columns it has are not known.
+        let mut creations = source.creations.iter().filter(|creation| {
+            creation.statement_index > drop.statement_index
+                && creation.statement_index < completed.1
+        });
+        let (replacement_line, replacement_statement_index, replacement_columns) =
+            match creations.next() {
+                Some(first) if kind == RebuildKind::Recreate => (
+                    first.line,
+                    first.statement_index,
+                    creations
+                        .all(|creation| creation.columns == first.columns)
+                        .then(|| first.columns.clone())
+                        .flatten(),
+                ),
+                _ => (completed.0, completed.1, self.columns.clone()),
+            };
         RebuildSequence {
             kind,
             temporary_table: self.temporary_table.canonical(),
-            original_table: original.canonical(),
+            original_table: source.table.canonical(),
             create_line: self.create_line,
-            copy_line: self.copy_line,
-            drop_line: self.drop_line,
-            replacement_line: self.replacement_line,
-            foreign_keys_enabled_at_drop: self.foreign_keys_enabled_at_drop,
-            drop_statement_index: self.drop_statement_index,
-            replacement_statement_index: self.replacement_statement_index,
-            temporary_table_parts: self.temporary_table.parts,
-            original_table_parts: original.parts,
-            replacement_columns: self.replacement_columns,
+            copy_line: source.copy_line,
+            drop_line: drop.line,
+            replacement_line,
+            foreign_keys_enabled_at_drop: drop.foreign_keys_enabled,
+            drop_statement_index: drop.statement_index,
+            replacement_statement_index,
+            temporary_table_parts: self.temporary_table.parts.clone(),
+            original_table_parts: source.table.parts.clone(),
+            replacement_columns,
         }
     }
 }
