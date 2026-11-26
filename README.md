@@ -127,11 +127,11 @@ builds.
   not parse other SQL dialects.
 - Include the starting schema. Tables, indexes and triggers from earlier migrations or the live database are
   invisible otherwise; the Rails task includes them for you.
-- A reference counts from its `CREATE TABLE` until the input drops that child table, and follows a parent through
-  `ALTER TABLE ... RENAME TO`. Rebuilding the child without the foreign key clears it the same way. A child created
-  in a transaction that rolls back does not count; a drop that a `ROLLBACK` undoes before the parent rebuild does
-  not clear it. When it can't tell whether a drop removed the child (a temp table used that name earlier, the
-  child was renamed, a rollback names no open savepoint), it keeps warning.
+- A reference counts from its `CREATE TABLE` until the input drops that child table or the column that declares
+  it, and follows both tables through `ALTER TABLE ... RENAME TO`. Rebuilding the child without the foreign key
+  clears it the same way. A child created in a transaction that rolls back does not count; a drop that a
+  `ROLLBACK` undoes before the parent rebuild does not clear it. When it can't tell whether a drop removed the
+  child (a temp table used that name earlier, a rollback names no open savepoint), it keeps warning.
 - It recognises three rebuild shapes: create, copy, drop, rename (Drizzle, SQLite's documented procedure); copy
   out, drop, create again, copy back (Rails); and rename the table away, create it again under the old name, copy,
   drop the renamed table. The third is the order that SQLite's
