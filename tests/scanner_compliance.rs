@@ -1,4 +1,4 @@
-use sqlite_doctor::scan_sql;
+use sqlite_doctor::{RebuildKind, scan_sql};
 
 #[test]
 fn trigger_body_is_one_statement_and_cannot_change_outer_state() {
@@ -257,4 +257,97 @@ DROP TABLE t;
 ALTER TABLE __new_t RENAME TO t;
 "#;
     assert!(scan_sql(reused_steps).rebuilds.is_empty());
+}
+
+#[test]
+fn rename_away_rebuild_ends_at_the_drop_of_the_renamed_table() {
+    let sql = r#"
+ALTER TABLE users RENAME TO users_old;
+CREATE TABLE users(id INTEGER, name TEXT);
+INSERT INTO users SELECT id, name FROM users_old;
+DROP TABLE users_old;
+"#;
+    let report = scan_sql(sql);
+    assert_eq!(report.rebuilds.len(), 1);
+    let rebuild = &report.rebuilds[0];
+    assert_eq!(rebuild.kind, RebuildKind::RenameAway);
+    assert_eq!(rebuild.original_table, "users");
+    assert_eq!(rebuild.temporary_table, "users_old");
+    assert_eq!(rebuild.dropped_table(), "users_old");
+    assert_eq!(
+        (
+            rebuild.create_line,
+            rebuild.copy_line,
+            rebuild.drop_line,
+            rebuild.replacement_line
+        ),
+        (3, 4, 5, 3)
+    );
+
+    let copied_before_the_rename = r#"
+CREATE TABLE users(id INTEGER, name TEXT);
+INSERT INTO users SELECT id, name FROM users_old;
+ALTER TABLE users RENAME TO users_old;
+DROP TABLE users_old;
+"#;
+    assert!(scan_sql(copied_before_the_rename).rebuilds.is_empty());
+
+    let nothing_copied = r#"
+ALTER TABLE users RENAME TO users_old;
+CREATE TABLE users(id INTEGER, name TEXT);
+DROP TABLE users_old;
+"#;
+    assert!(scan_sql(nothing_copied).rebuilds.is_empty());
+}
+
+#[test]
+fn a_rename_after_the_drop_makes_it_a_rename_rebuild_reported_once() {
+    let sql = r#"
+CREATE TABLE __new_t(id);
+INSERT INTO __new_t SELECT id FROM t;
+DROP TABLE t;
+ALTER TABLE __new_t RENAME TO t;
+CREATE TABLE __new_t(id, value);
+INSERT INTO __new_t SELECT id, NULL FROM t;
+DROP TABLE t;
+ALTER TABLE __new_t RENAME TO t;
+"#;
+    let report = scan_sql(sql);
+    assert_eq!(
+        report
+            .rebuilds
+            .iter()
+            .map(|rebuild| (rebuild.kind, rebuild.drop_line))
+            .collect::<Vec<_>>(),
+        [(RebuildKind::Rename, 4), (RebuildKind::Rename, 8)]
+    );
+}
+
+#[test]
+fn a_with_clause_is_part_of_the_copy_only_in_an_insert() {
+    for copy in [
+        "WITH src AS (SELECT id FROM t) INSERT INTO __new_t SELECT id FROM src",
+        "WITH RECURSIVE src(id) AS NOT MATERIALIZED (SELECT id FROM t) REPLACE INTO __new_t SELECT id FROM src",
+        "INSERT INTO __new_t(id) WITH src AS (SELECT id FROM t) SELECT id FROM src",
+        "WITH \"insert\" AS (SELECT id FROM t) INSERT OR IGNORE INTO __new_t SELECT id FROM \"insert\"",
+    ] {
+        let sql = format!(
+            "CREATE TABLE __new_t(id);\n{copy};\nDROP TABLE t;\nALTER TABLE __new_t RENAME TO t;"
+        );
+        let report = scan_sql(&sql);
+        assert_eq!(report.rebuilds.len(), 1, "{copy}");
+        assert_eq!(report.rebuilds[0].original_table, "t", "{copy}");
+        assert_eq!(report.rebuilds[0].copy_line, 2, "{copy}");
+    }
+
+    for not_a_copy in [
+        "WITH src AS (SELECT id FROM t) SELECT id FROM src",
+        "WITH src AS (SELECT id FROM t) DELETE FROM __new_t WHERE id IN (SELECT id FROM src)",
+        "WITH",
+    ] {
+        let sql = format!(
+            "CREATE TABLE __new_t(id);\n{not_a_copy};\nDROP TABLE t;\nALTER TABLE __new_t RENAME TO t;"
+        );
+        assert!(scan_sql(&sql).rebuilds.is_empty(), "{not_a_copy}");
+    }
 }

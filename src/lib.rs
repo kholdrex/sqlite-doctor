@@ -104,7 +104,7 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
             if !same_schema
                 || !referenced_tables
                     .iter()
-                    .any(|table| name_parts_match(table, &rebuild.original_table_parts))
+                    .any(|table| name_parts_match(table, rebuild.dropped_table_parts()))
             {
                 continue;
             }
@@ -140,7 +140,7 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
                 || !in_schema_of(rebuild, &schema_object.table_schema)
                 || !tables
                     .iter()
-                    .any(|table| name_parts_match(table, &rebuild.original_table_parts))
+                    .any(|table| name_parts_match(table, rebuild.dropped_table_parts()))
             {
                 continue;
             }
@@ -207,7 +207,7 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
                     rebuild.drop_line,
                     format!(
                         "Dropping `{}` removes {} `{}` from line {}. The input does not recreate it.",
-                        rebuild.original_table,
+                        rebuild.dropped_table(),
                         schema_object.kind.label(),
                         schema_object.name,
                         schema_object.line
@@ -431,7 +431,7 @@ fn exists_at(
             && in_schema_of(rebuild, &schema_object.table_schema)
             && tables_then(rebuild.drop_statement_index)
                 .iter()
-                .any(|table| name_parts_match(table, &rebuild.original_table_parts))
+                .any(|table| name_parts_match(table, rebuild.dropped_table_parts()))
     });
     holds_at(schema_object.statement_index, schema_object.undone_at, at)
         && !dropped
@@ -442,7 +442,9 @@ fn exists_at(
 
 /// The columns of the table that takes the original's place, under every name
 /// a `RENAME COLUMN` gave them: on the replacement before a rename swap, or on
-/// the recreated table before the rows are copied back.
+/// the recreated table before the rows are copied back. In a rename-away
+/// rebuild every such rename under the original name counts, since the
+/// rebuild does not record where the replacement was created.
 fn replacement_columns(report: &ScanReport, rebuild: &RebuildSequence) -> Option<Vec<String>> {
     let mut columns = rebuild.replacement_columns.clone()?;
     for change in &report.column_changes {
@@ -454,6 +456,9 @@ fn replacement_columns(report: &ScanReport, rebuild: &RebuildSequence) -> Option
             RebuildKind::Recreate => {
                 change.statement_index > rebuild.replacement_statement_index
                     && name_parts_match(&change.table_parts, &rebuild.original_table_parts)
+            }
+            RebuildKind::RenameAway => {
+                name_parts_match(&change.table_parts, &rebuild.original_table_parts)
             }
         };
         if let Some(to) = &change.to
@@ -548,7 +553,7 @@ fn dropped_between(report: &ScanReport, rebuild: &RebuildSequence, to: usize) ->
                 )
                 && replacement_names_at(report, rebuild, later.drop_statement_index)
                     .iter()
-                    .any(|table| name_parts_match(&later.original_table_parts, table))
+                    .any(|table| name_parts_match(later.dropped_table_parts(), table))
         })
 }
 

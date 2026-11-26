@@ -20,11 +20,18 @@ pub enum RebuildKind {
     /// Copy rows out to a holding table, drop the original, recreate it under
     /// its own name, then copy the rows back (Rails `alter_table`).
     Recreate,
+    /// Rename the original away, create the replacement under the original
+    /// name, copy the rows into it, then drop the renamed original. SQLite
+    /// points the references of other tables at the new name when it renames
+    /// the original, so that drop fires their `ON DELETE` actions.
+    RenameAway,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebuildSequence {
     pub kind: RebuildKind,
+    /// The replacement or holding table. In a rename-away rebuild, the name
+    /// the original has when it is dropped.
     pub temporary_table: String,
     pub original_table: String,
     /// One-based source lines for each statement in the rebuild sequence.
@@ -38,6 +45,9 @@ pub struct RebuildSequence {
     /// means the input did not establish a state the scanner can observe.
     pub foreign_keys_enabled_at_drop: Option<bool>,
     pub(crate) drop_statement_index: usize,
+    /// The statement from which an index or trigger can be created on the
+    /// replacement under the original name. In a rename-away rebuild that is
+    /// the drop: until then the renamed original still holds the name.
     pub(crate) replacement_statement_index: usize,
     pub(crate) temporary_table_parts: Vec<String>,
     pub(crate) original_table_parts: Vec<String>,
@@ -47,6 +57,23 @@ pub struct RebuildSequence {
     /// Columns of the table that takes the original name, when its CREATE
     /// TABLE lists them.
     pub(crate) replacement_columns: Option<Vec<String>>,
+}
+
+impl RebuildSequence {
+    /// The name of the original table when the DROP removes it.
+    pub fn dropped_table(&self) -> &str {
+        match self.kind {
+            RebuildKind::RenameAway => &self.temporary_table,
+            RebuildKind::Rename | RebuildKind::Recreate => &self.original_table,
+        }
+    }
+
+    pub(crate) fn dropped_table_parts(&self) -> &[String] {
+        match self.kind {
+            RebuildKind::RenameAway => &self.temporary_table_parts,
+            RebuildKind::Rename | RebuildKind::Recreate => &self.original_table_parts,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,9 +219,9 @@ pub(crate) struct ColumnChange {
     pub(crate) to: Option<String>,
 }
 
-/// Recognizes copy/drop/rename and copy-out/drop/recreate/copy-back rebuilds.
-/// Records the foreign-key pragmas, `ON DELETE` references, indexes and
-/// triggers in the input.
+/// Recognizes copy/drop/rename, copy-out/drop/recreate/copy-back and
+/// rename-away/create/copy/drop rebuilds. Records the foreign-key pragmas,
+/// `ON DELETE` references, indexes and triggers in the input.
 pub fn scan_sql(sql: &str) -> ScanReport {
     let statements = statements(sql);
     let mut report = ScanReport::default();
@@ -391,6 +418,7 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 schema: created_identity(statement, &created).0,
                 temporary_table: created,
                 create_line: statement.line,
+                create_statement_index: statement_index,
                 columns,
                 sources: Vec::new(),
             });
@@ -422,10 +450,7 @@ pub fn scan_sql(sql: &str) -> ScanReport {
             });
             let (scratch_table, rebuilds) = copied_back.unwrap_or_default();
             for (rebuild, schema_matches) in rebuilds {
-                if schema_matches {
-                    forget_siblings(&mut candidates, rebuild.drop_statement_index);
-                }
-                report.rebuilds.push(rebuild);
+                complete(&mut report, &mut candidates, rebuild, schema_matches);
             }
 
             // `t` and `main.t` are one table unless a temp `t` shadows it.
@@ -438,6 +463,7 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                         .is_some_and(|scratch| scratch.matches(&table)),
                     table,
                     copy_line: statement.line,
+                    copy_statement_index: statement_index,
                     drops: Vec::new(),
                     creations: Vec::new(),
                 })
@@ -455,6 +481,19 @@ pub fn scan_sql(sql: &str) -> ScanReport {
         }
 
         if let Some((dropped, table)) = dropped {
+            let drop = DropPoint {
+                line: statement.line,
+                statement_index,
+                foreign_keys_enabled,
+                table,
+            };
+            // The drop is the last step when the original was renamed away
+            // and its replacement already has the original name.
+            let renamed_away = candidates
+                .iter()
+                .rev()
+                .find_map(|candidate| candidate.renamed_away(&report, &dropped, &drop));
+            report.rebuilds.extend(renamed_away);
             // A backup copy of the same table must not consume the drop that
             // belongs to the real rebuild, so every copy records it; the
             // rename or copy-back completes only the one that replaces the
@@ -464,12 +503,7 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 .flat_map(|candidate| candidate.sources.iter_mut())
                 .filter(|source| source.table.matches(&dropped))
             {
-                source.drops.push(DropPoint {
-                    line: statement.line,
-                    statement_index,
-                    foreign_keys_enabled,
-                    table: table.clone(),
-                });
+                source.drops.push(drop.clone());
             }
             continue;
         }
@@ -491,10 +525,7 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 (!rebuilds.is_empty()).then_some(rebuilds)
             });
             for (rebuild, schema_matches) in renamed.into_iter().flatten() {
-                if schema_matches {
-                    forget_siblings(&mut candidates, rebuild.drop_statement_index);
-                }
-                report.rebuilds.push(rebuild);
+                complete(&mut report, &mut candidates, rebuild, schema_matches);
             }
             // A rename brings a dropped name back like a CREATE does; the
             // columns of that table are not known here.
@@ -1417,12 +1448,34 @@ fn table_definition_ranges(tokens: &[Token], opening_parenthesis: usize) -> Vec<
 }
 
 /// The table an `INSERT ... SELECT` fills and every table its rows may come
-/// from: the names after FROM and JOIN, also in subqueries.
+/// from: the names after FROM and JOIN, also in subqueries and in the queries
+/// of a WITH clause before the INSERT or before its SELECT. The name of such
+/// a query counts as a table too.
 fn copied_table(statement: &Statement) -> Option<(Name, Vec<Name>)> {
     let tokens = &statement.tokens;
+    if !token_is(tokens, 0, "WITH") {
+        return inserted_table(tokens, 0);
+    }
+    // The queries of the WITH clause are in parentheses, so the INSERT is the
+    // one outside them.
+    let mut depth = 0usize;
+    (0..tokens.len()).find_map(|position| {
+        match tokens[position].kind {
+            TokenKind::Symbol('(') => depth += 1,
+            TokenKind::Symbol(')') => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        (depth == 0)
+            .then(|| inserted_table(tokens, position))
+            .flatten()
+    })
+}
+
+/// The copy whose INSERT or REPLACE keyword is the token at `start`.
+fn inserted_table(tokens: &[Token], start: usize) -> Option<(Name, Vec<Name>)> {
     // `INSERT [OR resolution] INTO` or its alias `REPLACE INTO`.
-    let mut index = 1;
-    if token_is(tokens, 0, "INSERT") {
+    let mut index = start + 1;
+    if token_is(tokens, start, "INSERT") {
         if token_is(tokens, index, "OR")
             && ["ABORT", "FAIL", "IGNORE", "REPLACE", "ROLLBACK"]
                 .iter()
@@ -1430,7 +1483,7 @@ fn copied_table(statement: &Statement) -> Option<(Name, Vec<Name>)> {
         {
             index += 2;
         }
-    } else if !token_is(tokens, 0, "REPLACE") {
+    } else if !token_is(tokens, start, "REPLACE") {
         return None;
     }
     if !token_is(tokens, index, "INTO") {
@@ -1440,10 +1493,11 @@ fn copied_table(statement: &Statement) -> Option<(Name, Vec<Name>)> {
     if symbol_is(tokens, index, '(') {
         index = after_balanced_parentheses(tokens, index)?;
     }
-    if !token_is(tokens, index, "SELECT") {
+    if !token_is(tokens, index, "SELECT") && !token_is(tokens, index, "WITH") {
         return None;
     }
-    let sources: Vec<_> = (index + 1..tokens.len())
+    let sources: Vec<_> = (0..start)
+        .chain(index + 1..tokens.len())
         .filter(|position| {
             token_is(tokens, *position, "JOIN")
                 // Not the FROM of `IS [NOT] DISTINCT FROM`.
@@ -1576,6 +1630,26 @@ fn changed_column(statement: &Statement) -> Option<(Name, String, Option<String>
     Some((table, from, Some(identifier(tokens.get(index + 2)?)?)))
 }
 
+/// Records a rebuild that a rename or a copy-back finished. If its drop had
+/// been taken for the last step of a rename-away rebuild, this one replaces
+/// that reading. A drop in another schema than the replacement stays
+/// available to the candidate it belongs to.
+fn complete(
+    report: &mut ScanReport,
+    candidates: &mut [RebuildCandidate],
+    rebuild: RebuildSequence,
+    schema_matches: bool,
+) {
+    if schema_matches {
+        forget_siblings(candidates, rebuild.drop_statement_index);
+    }
+    report.rebuilds.retain(|earlier| {
+        earlier.kind != RebuildKind::RenameAway
+            || earlier.drop_statement_index != rebuild.drop_statement_index
+    });
+    report.rebuilds.push(rebuild);
+}
+
 /// Other copies taken before the same DROP describe the same destroyed table;
 /// once one of them completes the rebuild they must not report it again. The
 /// copies stay, in case the table is dropped again.
@@ -1596,6 +1670,7 @@ fn forget_siblings(candidates: &mut [RebuildCandidate], drop_statement_index: us
 struct CopySource {
     table: Name,
     copy_line: usize,
+    copy_statement_index: usize,
     drops: Vec<DropPoint>,
     creations: Vec<Creation>,
     /// A scratch table recorded at a copy-back: the candidate may replace it
@@ -1624,11 +1699,64 @@ struct RebuildCandidate {
     temporary_table: Name,
     schema: String,
     create_line: usize,
+    create_statement_index: usize,
     columns: Option<Vec<String>>,
     sources: Vec<CopySource>,
 }
 
 impl RebuildCandidate {
+    /// The rename-away rebuild that the drop of `dropped` finishes: one or
+    /// more `ALTER TABLE ... RENAME TO` took the table now called `dropped`
+    /// from this name to that one, and a table of this name then received
+    /// rows from it.
+    fn renamed_away(
+        &self,
+        report: &ScanReport,
+        dropped: &Name,
+        drop: &DropPoint,
+    ) -> Option<RebuildSequence> {
+        let original = self.temporary_table.leaf();
+        let renamed_before = |at: usize| {
+            let mut names = vec![dropped.leaf()];
+            for change in report.table_changes.iter().rev() {
+                if change.statement_index < at
+                    && let TableChangeKind::RenamedTo { name, .. } = &change.kind
+                    && names.contains(&name.as_str())
+                {
+                    names.push(&change.table.1);
+                }
+            }
+            names[1..].contains(&original)
+        };
+        let source = self.sources.iter().find(|source| {
+            source.table.matches(dropped)
+                && !source.replaces_only
+                && renamed_before(source.copy_statement_index)
+        })?;
+        Some(RebuildSequence {
+            kind: RebuildKind::RenameAway,
+            temporary_table: source.table.canonical(),
+            original_table: self.temporary_table.canonical(),
+            create_line: self.create_line,
+            copy_line: source.copy_line,
+            drop_line: drop.line,
+            replacement_line: self.create_line,
+            foreign_keys_enabled_at_drop: drop.foreign_keys_enabled,
+            drop_statement_index: drop.statement_index,
+            replacement_statement_index: drop.statement_index,
+            temporary_table_parts: source.table.parts.clone(),
+            original_table_parts: self.temporary_table.parts.clone(),
+            original_schema: drop.table.as_ref().map(|(schema, _)| schema.clone()),
+            // A CREATE TABLE from before the rename is the original's; the
+            // replacement then came from a statement that left no record,
+            // such as CREATE TABLE IF NOT EXISTS, and its columns are not
+            // known.
+            replacement_columns: renamed_before(self.create_statement_index)
+                .then(|| self.columns.clone())
+                .flatten(),
+        })
+    }
+
     /// The rebuilds of `original` that the statement at `completed` (line,
     /// index) finishes: one for every drop that may have destroyed that
     /// table.
