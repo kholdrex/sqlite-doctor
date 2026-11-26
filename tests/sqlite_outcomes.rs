@@ -127,6 +127,32 @@ fn a_rename_away_rebuild_is_reported_at_the_drop_of_the_renamed_table() {
 }
 
 #[test]
+fn a_table_recreated_as_select_is_reported_at_its_drop() {
+    let sql = fixture("cascade/held_and_recreated_as_select.sql");
+    let cascade = &findings(&sql, HazardId::DeleteActionOnRebuild)[0];
+
+    assert_eq!(cascade.line, line_of(&sql, "DROP TABLE accounts;"));
+    assert!(
+        cascade
+            .detail
+            .contains("`orders` references rebuilt table `accounts`")
+    );
+}
+
+#[test]
+fn an_index_is_reported_when_create_table_as_select_leaves_its_column_out() {
+    let sql = fixture("lost_index/indexed_column_not_selected_in_create_as_select.sql");
+    let missing = &findings(&sql, HazardId::MissingSchemaObjectRestoration)[0];
+
+    assert_eq!(missing.line, line_of(&sql, "DROP TABLE users;"));
+    assert!(
+        missing
+            .detail
+            .contains("Dropping `users` removes index `idx_users_email`")
+    );
+}
+
+#[test]
 fn an_index_lost_in_a_rename_away_rebuild_names_the_table_that_is_dropped() {
     let sql = fixture("lost_index/index_on_a_table_renamed_away.sql");
     let missing = &findings(&sql, HazardId::MissingSchemaObjectRestoration)[0];
