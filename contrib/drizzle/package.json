@@ -1,6 +1,6 @@
 {
   "name": "sqlite-doctor-drizzle",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Checks pending Drizzle migrations for SQLite table rebuilds that delete rows, by running them on a copy and scanning the SQL with sqlite-doctor.",
   "license": "MIT",
   "author": "Alex Kholodniak",

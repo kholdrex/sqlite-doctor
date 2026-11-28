@@ -449,7 +449,9 @@ export function findBinary(binary = process.env.SQLITE_DOCTOR) {
   return found;
 }
 
-export function report(binary, result, output, print, shown = output) {
+// `shown` is the capture the user keeps, if any; the scanned file is
+// removed when the check ends, so it is not named.
+export function report(binary, result, output, print, shown = null) {
   const run = spawnSync(binary, ["--format", "json", output], { encoding: "utf8", maxBuffer: MAX_BUFFER });
   if (run.error) throw new CheckError(`${binary} could not be run: ${run.error.message}`);
   let parsed = null;
@@ -465,7 +467,7 @@ export function report(binary, result, output, print, shown = output) {
   else print(`${result.pending.length} pending migration(s):\n${result.pending.map((name) => `  ${name}`).join("\n")}`);
   for (const finding of parsed.findings) {
     const where = finding.location.line ? `${finding.location.source}:${finding.location.line}` : finding.location.source;
-    print(`\n${finding.code}: ${finding.title}\n  --> ${where} (${shown}:${finding.line})\n  ${finding.detail}\n  help: ${finding.remediation}`);
+    print(`\n${finding.code}: ${finding.title}\n  --> ${where}${shown ? ` (${shown}:${finding.line})` : ""}\n  ${finding.detail}\n  help: ${finding.remediation}`);
   }
   for (const line of result.shrunk) print(`Rows lost on the copy: ${line}`);
   if (!parsed.complete) print(`\nCheck incomplete:\n${parsed.incomplete.map((item) => `- ${item.reason}`).join("\n")}`);
@@ -536,7 +538,7 @@ export async function check(options, print = console.log) {
     fs.writeFileSync(scanned, content, { flag: "wx", mode: 0o600 });
     const output = options.output && path.resolve(root, options.output);
     if (output) writeCapture(output, content);
-    return report(binary, result, scanned, print, output ? path.relative(root, output) : scanned);
+    return report(binary, result, scanned, print, output && path.relative(root, output));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
