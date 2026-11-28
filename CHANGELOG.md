@@ -8,8 +8,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- The Rails helper is a gem, `sqlite_doctor` (gemspec at the repository
-  root, code in `contrib/rails/lib`). `bin/rails sqlite_doctor:check` captures
+- The Rails helper is a gem, `sqlite_doctor`, on RubyGems from 0.4.0
+  (gemspec at the repository root, code in `contrib/rails/lib`). `bin/rails sqlite_doctor:check` captures
   the pending migrations, scans them with the `sqlite-doctor` binary (0.3.0
   or newer), prints each finding with the migration it came from and exits
   `1` with findings or `2` when the check is incomplete or fails.
