@@ -14,7 +14,6 @@ export const CAPTURE_HEADER = "-- sqlite-doctor capture:";
 export const SUPPORTED = /^0\.45\./;
 const RESERVED_LINE = /^[ \t\f\r\ufeff]*-- sqlite-doctor:/m;
 const BREAKPOINT = "--> statement-breakpoint";
-const OUTSIDE_WRITE = /\b(ATTACH|VACUUM)\b/i;
 const MAX_BUFFER = 1024 ** 3;
 
 export class CheckError extends Error {}
@@ -51,7 +50,7 @@ export function loadRunner(root) {
   const resolvers = [require];
   const kit = (require.resolve.paths("drizzle-kit") ?? []).map((dir) => path.join(dir, "drizzle-kit", "package.json"))
     .find((manifest) => fs.existsSync(manifest));
-  if (kit) resolvers.push(createRequire(kit));
+  if (kit) resolvers.push(createRequire(fs.realpathSync(kit)));
   const libsql = resolvers.some((resolver) => {
     try {
       resolver.resolve("@libsql/client");
@@ -72,13 +71,17 @@ export function loadRunner(root) {
 
 // The migrations drizzle-orm 0.45 reads: the journal's entries, each file
 // split at statement breakpoints.
-export function readMigrations(folder) {
+// `source` is where the files came from, for labels, when `folder` is a
+// snapshot of it.
+export function readMigrations(folder, source = folder) {
   const journal = path.join(folder, "meta", "_journal.json");
-  if (!fs.existsSync(journal)) throw new CheckError(`${journal} does not exist`);
+  if (!fs.existsSync(journal)) throw new CheckError(`${path.join(source, "meta", "_journal.json")} does not exist`);
   return JSON.parse(fs.readFileSync(journal, "utf8")).entries.map((entry) => {
-    const file = path.join(folder, `${entry.tag}.sql`);
-    if (!fs.existsSync(file)) throw new CheckError(`${file} is listed in the journal but does not exist`);
-    const text = fs.readFileSync(file, "utf8");
+    const file = path.join(source, `${entry.tag}.sql`);
+    if (!fs.existsSync(path.join(folder, `${entry.tag}.sql`))) {
+      throw new CheckError(`${file} is listed in the journal but does not exist`);
+    }
+    const text = fs.readFileSync(path.join(folder, `${entry.tag}.sql`), "utf8");
     const chunks = [];
     let offset = 0;
     for (const chunk of text.split(BREAKPOINT)) {
@@ -93,13 +96,35 @@ export function quoteIdentifier(name) {
   return `"${name.replaceAll('"', '""')}"`;
 }
 
+// The journal and the files it names, copied to `target`, so the migrator
+// runs exactly the files that were checked.
+export function snapshot(folder, target) {
+  const journal = fs.readFileSync(path.join(folder, "meta", "_journal.json"));
+  fs.mkdirSync(path.join(target, "meta"), { recursive: true });
+  fs.writeFileSync(path.join(target, "meta", "_journal.json"), journal);
+  for (const { tag } of JSON.parse(journal.toString("utf8")).entries) {
+    const name = path.posix.normalize(`${tag}.sql`);
+    if (name.startsWith("../") || path.isAbsolute(name)) throw new CheckError(`the journal names ${tag}, outside the folder`);
+    const file = path.join(target, ...name.split("/"));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.copyFileSync(path.join(folder, name), file);
+  }
+  return target;
+}
+
+// The SQL with comments, strings and quoted names blanked out.
+function code(sql) {
+  return sql.replace(/--[^\n]*|\/\*[\s\S]*?(\*\/|$)|'(?:[^']|'')*('|$)|"(?:[^"]|"")*("|$)|`(?:[^`]|``)*(`|$)|\[[^\]]*(\]|$)/g, " ");
+}
+
 // ATTACH and VACUUM INTO write to files other than the copy, so a migration
-// that may use them is not run.
+// with such a statement is not run.
 function refuseOutsideWrites(migrations, relative) {
-  const found = migrations.find((migration) => OUTSIDE_WRITE.test(migration.text));
+  const found = migrations.find((migration) => code(migration.text).split(";")
+    .some((statement) => /^\s*(ATTACH\b|VACUUM\b[\s\S]*\bINTO\b)/i.test(statement)));
   if (found) {
-    throw new CheckError(`${relative(found.file)} mentions ATTACH or VACUUM, which can write outside the temporary ` +
-      "database, so the check does not run it");
+    throw new CheckError(`${relative(found.file)} has an ATTACH or VACUUM INTO statement, which can write outside the ` +
+      "temporary database, so the check does not run it");
   }
 }
 
@@ -134,8 +159,8 @@ function lineAt(text, offset) {
 
 // Migrates `database` with the runner while recording what the connection
 // executes. The caller owns the file; it is changed.
-export function capture({ runner, database, folder, table = "__drizzle_migrations", foreignKeys, root }) {
-  const migrations = readMigrations(folder);
+export function capture({ runner, database, folder, source = folder, table = "__drizzle_migrations", foreignKeys, root }) {
+  const migrations = readMigrations(folder, source);
   const trace = [];
   let recording = false;
   const db = new runner.Database(database, { fileMustExist: true, verbose: (sql) => recording && trace.push({ sql }) });
@@ -151,19 +176,21 @@ export function capture({ runner, database, folder, table = "__drizzle_migration
       if (recording) trace.push({ sql: source, failed: true });
       throw error;
     }
-    const run = statement.run.bind(statement);
-    statement.run = (...args) => {
-      const logged = trace.length;
-      try {
-        return run(...args);
-      } catch (error) {
-        if (recording) {
-          if (trace.length > logged) trace[trace.length - 1].failed = true;
-          else trace.push({ sql: source, failed: true });
+    for (const method of ["run", "all", "get"]) {
+      const original = statement[method].bind(statement);
+      statement[method] = (...args) => {
+        const logged = trace.length;
+        try {
+          return original(...args);
+        } catch (error) {
+          if (recording) {
+            if (trace.length > logged) trace[trace.length - 1].failed = true;
+            else trace.push({ sql: source, failed: true });
+          }
+          throw error;
         }
-        throw error;
-      }
-    };
+      };
+    }
     return statement;
   };
   try {
@@ -222,18 +249,25 @@ function attribute(trace, pending, table, error, relative) {
   let index = 0;
   let position = 0;
   let inTransaction = false;
+  let prologue = 0;
+  let committed = false;
+  // SQLite keeps a statement's text up to its end, so only whitespace and
+  // comments may follow it in the chunk.
+  const runs = (chunk, sql) => sql.trim().length && chunk.text.startsWith(sql) &&
+    /^(?:\s|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*$/.test(chunk.text.slice(sql.length));
   for (const { sql, failed } of trace) {
     const migration = pending[index];
     const chunk = migration?.chunks[position];
-    if (!inTransaction) {
+    if (!inTransaction && !committed) {
       statements.push({ sql, label: { synthetic: "Drizzle migrator" }, failed });
-      inTransaction = /^\s*BEGIN\s*$/i.test(sql);
-    } else if (chunk && sql.length && chunk.text.startsWith(sql)) {
+      if (/^\s*BEGIN\s*$/i.test(sql)) inTransaction = true;
+      else prologue += 1;
+    } else if (inTransaction && chunk && runs(chunk, sql)) {
       const lead = sql.match(/^\s*/)[0].length;
       const line = lineAt(migration.text, chunk.offset + lead);
       statements.push({ sql: sql.slice(lead), label: { file: relative(migration.file), line }, failed });
       position += 1;
-    } else if (migration && sql.startsWith(ledgerInsert)) {
+    } else if (inTransaction && migration && sql.startsWith(ledgerInsert)) {
       const [, hash, when] = sql.slice(ledgerInsert.length - 1).match(/^'([0-9a-f]*)'(?:\/\*[^*]*\*\/)?, ([^,()]+)\)$/) ?? [];
       const digest = crypto.createHash("sha256").update(migration.text).digest("hex");
       if (position !== migration.chunks.length || Number(when) !== migration.when || !hash || !digest.startsWith(hash)) {
@@ -242,9 +276,10 @@ function attribute(trace, pending, table, error, relative) {
       statements.push({ sql, label: { synthetic: "Drizzle migrator" }, failed });
       index += 1;
       position = 0;
-    } else if (!migration && /^\s*COMMIT\s*$/i.test(sql)) {
+    } else if (inTransaction && !migration && /^\s*COMMIT\s*$/i.test(sql)) {
       statements.push({ sql, label: { synthetic: "Drizzle migrator" }, failed });
       inTransaction = false;
+      committed = true;
     } else if (error && /^\s*ROLLBACK\s*$/i.test(sql)) {
       statements.push({ sql, label: { synthetic: "Drizzle migrator" }, failed });
       inTransaction = false;
@@ -253,7 +288,9 @@ function attribute(trace, pending, table, error, relative) {
       incomplete.add("the migrator ran a statement that is not in the migration files");
     }
   }
-  if (!error && index !== pending.length) incomplete.add("the migrator ran a different number of migrations than expected");
+  if (!error && (index !== pending.length || prologue !== 2 || !committed)) {
+    incomplete.add("the recorded statements do not match the migrator's steps");
+  }
   return { statements, incomplete: [...incomplete] };
 }
 
@@ -307,8 +344,13 @@ export function writeCapture(output, content) {
   }
 }
 
+// Paths are passed as literal pathspecs whatever the environment says.
+const GIT_ENV = Object.fromEntries(Object.entries(process.env)
+  .filter(([name]) => !/^GIT_(LITERAL|GLOB|NOGLOB|ICASE)_PATHSPECS$/.test(name)));
+GIT_ENV.GIT_LITERAL_PATHSPECS = "1";
+
 function git(directory, ...args) {
-  const result = spawnSync("git", ["-C", directory, ...args], { encoding: "buffer", maxBuffer: MAX_BUFFER });
+  const result = spawnSync("git", ["-C", directory, ...args], { encoding: "buffer", maxBuffer: MAX_BUFFER, env: GIT_ENV });
   if (result.error) throw new CheckError(`git ${args[0]} failed: ${result.error.message}`);
   if (result.status !== 0) throw new CheckError(`git ${args[0]} failed: ${result.stderr.toString().trim()}`);
   return result.stdout;
@@ -316,7 +358,7 @@ function git(directory, ...args) {
 
 // The tree entry at `name` in `commit`, or null.
 function treeEntry(top, commit, name) {
-  const listing = git(top, "ls-tree", "-z", "--full-tree", commit, "--", `:(literal)${name}`).toString("utf8");
+  const listing = git(top, "ls-tree", "-z", "--full-tree", commit, "--", name).toString("utf8");
   const entry = listing.split("\0").find(Boolean);
   if (!entry) return null;
   const tab = entry.indexOf("\t");
@@ -330,19 +372,42 @@ export function folderAt(base, folder, dir) {
   if (!base || base.startsWith("-") || /[\u0000-\u001f\u007f]/.test(base)) throw new CheckError("BASE must name a git revision");
   const absolute = path.resolve(folder);
   const top = git(absolute, "rev-parse", "--show-toplevel").toString().trim();
-  const relative = path.relative(fs.realpathSync(top), fs.realpathSync(absolute)).split(path.sep).join("/");
+  // The folder's own name as given, so a folder that is a symbolic link now
+  // is looked up under that name; the directory holding it as stored on disk.
+  const parent = fs.realpathSync.native(path.dirname(absolute));
+  const entries = fs.readdirSync(parent);
+  const own = entries.find((name) => name === path.basename(absolute)) ??
+    entries.find((name) => name.toLowerCase() === path.basename(absolute).toLowerCase()) ?? path.basename(absolute);
+  const relative = path.relative(fs.realpathSync.native(top), path.join(parent, own)).split(path.sep).join("/");
   if (relative === ".." || relative.startsWith("../")) throw new CheckError(`${folder} is outside the git repository`);
   const commit = git(top, "rev-parse", "--verify", "--end-of-options", `${base}^{commit}`).toString().trim();
+  // A missing entry under a symbolic link in the commit is not an absence.
+  const linked = (name) => {
+    const parts = name.split("/");
+    for (let k = 1; k < parts.length; k += 1) {
+      const entry = treeEntry(top, commit, parts.slice(0, k).join("/"));
+      if (entry?.mode === "120000") {
+        throw new CheckError(`${parts.slice(0, k).join("/")} is a symbolic link at ${base}, which the check does not follow`);
+      }
+      if (!entry) return;
+    }
+  };
   const blob = (name) => {
     const entry = treeEntry(top, commit, name);
-    if (!entry) return null;
+    if (!entry) {
+      linked(name);
+      return null;
+    }
     if (entry.mode === "120000") throw new CheckError(`${name} is a symbolic link at ${base}, which the check does not follow`);
     if (entry.type !== "blob") throw new CheckError(`${name} is not a file at ${base}`);
     return git(top, "cat-file", "blob", entry.object);
   };
   if (relative) {
     const entry = treeEntry(top, commit, relative);
-    if (!entry) return null;
+    if (!entry) {
+      linked(relative);
+      return null;
+    }
     if (entry.mode === "120000") throw new CheckError(`${relative} is a symbolic link at ${base}, which the check does not follow`);
     if (entry.type !== "tree") throw new CheckError(`${relative} is not a directory at ${base}`);
   }
@@ -384,7 +449,7 @@ export function findBinary(binary = process.env.SQLITE_DOCTOR) {
   return found;
 }
 
-export function report(binary, result, output, print) {
+export function report(binary, result, output, print, shown = output) {
   const run = spawnSync(binary, ["--format", "json", output], { encoding: "utf8", maxBuffer: MAX_BUFFER });
   if (run.error) throw new CheckError(`${binary} could not be run: ${run.error.message}`);
   let parsed = null;
@@ -400,7 +465,7 @@ export function report(binary, result, output, print) {
   else print(`${result.pending.length} pending migration(s):\n${result.pending.map((name) => `  ${name}`).join("\n")}`);
   for (const finding of parsed.findings) {
     const where = finding.location.line ? `${finding.location.source}:${finding.location.line}` : finding.location.source;
-    print(`\n${finding.code}: ${finding.title}\n  --> ${where} (${parsed.source}:${finding.line})\n  ${finding.detail}\n  help: ${finding.remediation}`);
+    print(`\n${finding.code}: ${finding.title}\n  --> ${where} (${shown}:${finding.line})\n  ${finding.detail}\n  help: ${finding.remediation}`);
   }
   for (const line of result.shrunk) print(`Rows lost on the copy: ${line}`);
   if (!parsed.complete) print(`\nCheck incomplete:\n${parsed.incomplete.map((item) => `- ${item.reason}`).join("\n")}`);
@@ -426,6 +491,10 @@ export async function check(options, print = console.log) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sqlite-doctor-drizzle-"));
   try {
     const database = path.join(dir, "database.sqlite3");
+    if (!fs.existsSync(path.join(folder, "meta", "_journal.json"))) {
+      throw new CheckError(`${path.join(folder, "meta", "_journal.json")} does not exist`);
+    }
+    const migrations = snapshot(folder, path.join(dir, "migrations"));
     if (options.base) {
       const baseFolder = folderAt(options.base, folder, dir);
       const db = new runner.Database(database);
@@ -455,7 +524,8 @@ export async function check(options, print = console.log) {
     const result = capture({
       runner,
       database,
-      folder,
+      folder: migrations,
+      source: folder,
       table: options.table,
       foreignKeys: options.foreignKeys,
       root,
@@ -464,8 +534,9 @@ export async function check(options, print = console.log) {
     const content = render(result);
     const scanned = path.join(dir, "capture.sql");
     fs.writeFileSync(scanned, content, { flag: "wx", mode: 0o600 });
-    if (options.output) writeCapture(path.resolve(root, options.output), content);
-    return report(binary, result, scanned, print);
+    const output = options.output && path.resolve(root, options.output);
+    if (output) writeCapture(output, content);
+    return report(binary, result, scanned, print, output ? path.relative(root, output) : scanned);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

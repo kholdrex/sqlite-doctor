@@ -224,15 +224,25 @@ test("a migration that mentions ATTACH is not run", async () => {
   seededDatabase(root);
   addMigration(root, "0002_attach", "ATTACH DATABASE 'other.db' AS other;", 1795893540000);
 
-  await assert.rejects(run({ root, database: "app.db" }), /0002_attach\.sql mentions ATTACH or VACUUM/);
+  await assert.rejects(run({ root, database: "app.db" }), /0002_attach\.sql has an ATTACH or VACUUM INTO statement/);
   assert.equal(fs.existsSync(path.join(root, "other.db")), false);
+});
+
+test("the words attach and vacuum in strings and comments do not stop the check", async () => {
+  const root = project(2);
+  seededDatabase(root);
+  addMigration(root, "0002_words", "-- vacuum later\nCREATE TABLE `notes` (`msg` text DEFAULT 'attach');", 1795893540000);
+
+  const { status, output } = await run({ root, database: "app.db" });
+
+  assert.equal(status, 0, output);
 });
 
 test("transaction statements in a migration file keep their file lines", async () => {
   const root = project(2);
   seededDatabase(root);
   addMigration(root, "0002_own_transaction",
-    "COMMIT;--> statement-breakpoint\nPRAGMA foreign_keys=OFF;--> statement-breakpoint\nBEGIN;", 1795893540000);
+    "COMMIT--> statement-breakpoint\nPRAGMA foreign_keys=OFF;--> statement-breakpoint\nBEGIN", 1795893540000);
 
   const { status, output } = await run({ root, database: "app.db", output: "capture.sql" });
 
@@ -253,11 +263,13 @@ test("a table name with a line break stays inside the capture comment", async ()
     'INSERT INTO `__new_parents`("id", "name") SELECT "id", "name" FROM `parents`;', 'INSERT INTO `__new_parents`("id") SELECT "id" FROM `parents`;'),
   1795893540000);
 
-  const { status, output } = await run({ root, database: "app.db" });
+  const { status, output } = await run({ root, database: "app.db", output: "capture.sql" });
 
   assert.equal(status, 1, output);
-  assert.match(output, /SQLD001: .*\n {2}--> drizzle\/0002_drop_name\.sql:8 /);
+  assert.match(output, /SQLD001: .*\n {2}--> drizzle\/0002_drop_name\.sql:8 \(capture\.sql:\d+\)/);
   assert.match(output, /Dependent table `kids\narchive`/);
+  const capture = fs.readFileSync(path.join(root, "capture.sql"), "utf8");
+  assert.match(capture, /^-- Observed on the copy: rows in kids archive: 1 -> 0$/m);
 });
 
 test("base reads nested migration files from a folder whose name has a tab", async () => {
