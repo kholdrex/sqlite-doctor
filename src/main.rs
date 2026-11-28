@@ -3,7 +3,7 @@ use std::io::{self, Read};
 use std::process::ExitCode;
 
 use serde_json::json;
-use sqlite_doctor::{Finding, HazardId, diagnose, scan_sql};
+use sqlite_doctor::{Finding, HazardId, check_sql};
 
 #[derive(Clone, Copy)]
 enum OutputFormat {
@@ -56,7 +56,7 @@ fn run(arguments: Vec<String>) -> Result<u8, String> {
 
     let source = source.ok_or_else(|| "provide a SQL file or `-` for stdin".to_string())?;
     let sql = read_source(&source)?;
-    let findings = diagnose(&scan_sql(&sql));
+    let findings = check_sql(&sql);
 
     match format {
         OutputFormat::Human => print_human(&source, &findings),

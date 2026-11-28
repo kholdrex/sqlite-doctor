@@ -5,6 +5,7 @@
 //! other inputs.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ForeignKeysPragmaInTransaction {
     /// One-based source line containing the PRAGMA statement.
     pub line: usize,
@@ -13,6 +14,7 @@ pub struct ForeignKeysPragmaInTransaction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RebuildKind {
     /// Create a replacement, copy rows into it, drop the original, then rename
     /// the replacement (Drizzle, SQLite's documented procedure).
@@ -28,6 +30,7 @@ pub enum RebuildKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RebuildSequence {
     pub kind: RebuildKind,
     /// The replacement or holding table. In a rename-away rebuild, the name
@@ -77,6 +80,7 @@ impl RebuildSequence {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SchemaObjectKind {
     Index,
     Trigger,
@@ -92,6 +96,7 @@ impl SchemaObjectKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SchemaObject {
     pub kind: SchemaObjectKind,
     pub name: String,
@@ -118,6 +123,7 @@ pub struct SchemaObject {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DroppedSchemaObject {
     pub kind: SchemaObjectKind,
     pub name: String,
@@ -134,6 +140,7 @@ pub struct DroppedSchemaObject {
 /// A foreign-key `ON DELETE` action that rewrites dependent rows when the
 /// referenced row is deleted, including by `DROP TABLE` on the parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeleteAction {
     Cascade,
     SetNull,
@@ -151,6 +158,7 @@ impl DeleteAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeleteActionReference {
     pub dependent_table: String,
     pub referenced_table: String,
@@ -200,15 +208,45 @@ pub(crate) enum TableChangeKind {
     },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanReport {
-    pub foreign_keys_pragmas_in_transactions: Vec<ForeignKeysPragmaInTransaction>,
-    pub rebuilds: Vec<RebuildSequence>,
-    pub delete_action_references: Vec<DeleteActionReference>,
-    pub schema_objects: Vec<SchemaObject>,
-    pub dropped_schema_objects: Vec<DroppedSchemaObject>,
+    pub(crate) foreign_keys_pragmas_in_transactions: Vec<ForeignKeysPragmaInTransaction>,
+    pub(crate) rebuilds: Vec<RebuildSequence>,
+    pub(crate) delete_action_references: Vec<DeleteActionReference>,
+    pub(crate) schema_objects: Vec<SchemaObject>,
+    pub(crate) dropped_schema_objects: Vec<DroppedSchemaObject>,
     pub(crate) table_changes: Vec<TableChange>,
     pub(crate) column_changes: Vec<ColumnChange>,
+}
+
+impl ScanReport {
+    /// `PRAGMA foreign_keys = ...` assignments recognised inside a
+    /// transaction, where SQLite ignores them.
+    pub fn foreign_keys_pragmas_in_transactions(&self) -> &[ForeignKeysPragmaInTransaction] {
+        &self.foreign_keys_pragmas_in_transactions
+    }
+
+    /// Complete table rebuilds, in the order their last statement appears.
+    pub fn rebuilds(&self) -> &[RebuildSequence] {
+        &self.rebuilds
+    }
+
+    /// Recognised foreign-key references with `ON DELETE CASCADE`,
+    /// `SET NULL` or `SET DEFAULT`.
+    pub fn delete_action_references(&self) -> &[DeleteActionReference] {
+        &self.delete_action_references
+    }
+
+    /// Recognised `CREATE INDEX` and `CREATE TRIGGER` statements.
+    pub fn schema_objects(&self) -> &[SchemaObject] {
+        &self.schema_objects
+    }
+
+    /// Recognised `DROP INDEX` and `DROP TRIGGER` statements, whether or not
+    /// the object existed.
+    pub fn dropped_schema_objects(&self) -> &[DroppedSchemaObject] {
+        &self.dropped_schema_objects
+    }
 }
 
 /// An `ALTER TABLE ... RENAME COLUMN`, or with `to` empty a `DROP COLUMN`.
@@ -225,7 +263,15 @@ pub(crate) struct ColumnChange {
 /// `ON DELETE` references, indexes and triggers in the input.
 pub fn scan_sql(sql: &str) -> ScanReport {
     let statements = statements(sql);
-    let mut report = ScanReport::default();
+    let mut report = ScanReport {
+        foreign_keys_pragmas_in_transactions: Vec::new(),
+        rebuilds: Vec::new(),
+        delete_action_references: Vec::new(),
+        schema_objects: Vec::new(),
+        dropped_schema_objects: Vec::new(),
+        table_changes: Vec::new(),
+        column_changes: Vec::new(),
+    };
     let mut foreign_keys_enabled = None;
     let mut legacy_alter_table = Some(false);
     let mut attached = false;

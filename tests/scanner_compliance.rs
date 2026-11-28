@@ -20,10 +20,10 @@ END;
 PRAGMA foreign_keys = OFF;
 "#;
     let report = scan_sql(sql);
-    assert_eq!(report.schema_objects.len(), 1);
-    assert_eq!(report.foreign_keys_pragmas_in_transactions.len(), 1);
-    assert_eq!(report.foreign_keys_pragmas_in_transactions[0].line, 11);
-    assert!(report.rebuilds.is_empty());
+    assert_eq!(report.schema_objects().len(), 1);
+    assert_eq!(report.foreign_keys_pragmas_in_transactions().len(), 1);
+    assert_eq!(report.foreign_keys_pragmas_in_transactions()[0].line, 11);
+    assert!(report.rebuilds().is_empty());
 }
 
 #[test]
@@ -43,8 +43,8 @@ fn every_insert_conflict_clause_copies_rows_in_both_rebuild_shapes() {
         let recreate = format!(
             "CREATE TEMP TABLE held(id);\n{insert} held SELECT id FROM t;\nDROP TABLE t;\nCREATE TABLE t(id INTEGER PRIMARY KEY);\n{insert} t SELECT id FROM held;\n"
         );
-        assert_eq!(scan_sql(&rename).rebuilds.len(), 1, "{insert}");
-        assert_eq!(scan_sql(&recreate).rebuilds.len(), 1, "{insert}");
+        assert_eq!(scan_sql(&rename).rebuilds().len(), 1, "{insert}");
+        assert_eq!(scan_sql(&recreate).rebuilds().len(), 1, "{insert}");
     }
 }
 
@@ -58,8 +58,8 @@ DROP TABLE t;
 ALTER TABLE __new_t RENAME TO t;
 "#;
     let report = scan_sql(sql);
-    assert_eq!(report.rebuilds.len(), 1);
-    assert_eq!(report.rebuilds[0].original_table, "t");
+    assert_eq!(report.rebuilds().len(), 1);
+    assert_eq!(report.rebuilds()[0].original_table, "t");
 }
 
 #[test]
@@ -82,7 +82,7 @@ PRAGMA foreign_keys=OFF;
 "#;
     let report = scan_sql(sql);
     let lines: Vec<_> = report
-        .foreign_keys_pragmas_in_transactions
+        .foreign_keys_pragmas_in_transactions()
         .iter()
         .map(|finding| finding.line)
         .collect();
@@ -103,13 +103,14 @@ fn every_rollback_to_savepoint_spelling_stays_inside_the_transaction() {
         );
         let report = scan_sql(&sql);
         let lines: Vec<_> = report
-            .foreign_keys_pragmas_in_transactions
+            .foreign_keys_pragmas_in_transactions()
             .iter()
             .map(|pragma| pragma.line)
             .collect();
         assert_eq!(lines, vec![4], "{rollback}");
         assert_eq!(
-            report.rebuilds[0].foreign_keys_enabled_at_drop, None,
+            report.rebuilds()[0].foreign_keys_enabled_at_drop,
+            None,
             "{rollback}"
         );
     }
@@ -125,7 +126,7 @@ fn named_transactions_end_like_unnamed_ones() {
         let sql = format!("BEGIN TRANSACTION migration;\n{end};\nPRAGMA foreign_keys=OFF;\n");
         let report = scan_sql(&sql);
         assert!(
-            report.foreign_keys_pragmas_in_transactions.is_empty(),
+            report.foreign_keys_pragmas_in_transactions().is_empty(),
             "{end}"
         );
     }
@@ -137,7 +138,7 @@ fn a_rejected_commit_and_a_quoted_savepoint_leave_the_transaction_open() {
         let sql = format!("{opening};\nPRAGMA foreign_keys=OFF;\n");
         let report = scan_sql(&sql);
         assert_eq!(
-            report.foreign_keys_pragmas_in_transactions.len(),
+            report.foreign_keys_pragmas_in_transactions().len(),
             1,
             "{opening}"
         );
@@ -163,7 +164,7 @@ COMMIT;
 "#;
     let report = scan_sql(sql);
     let lines: Vec<_> = report
-        .foreign_keys_pragmas_in_transactions
+        .foreign_keys_pragmas_in_transactions()
         .iter()
         .map(|finding| finding.line)
         .collect();
@@ -180,9 +181,9 @@ fn lexer_ignores_decoys_and_handles_quoting_crlf_and_eof() {
         "/* CREATE TABLE __new_bad(x); */ PRAGMA foreign_keys = 0"
     );
     let report = scan_sql(sql);
-    assert_eq!(report.foreign_keys_pragmas_in_transactions.len(), 1);
-    assert_eq!(report.foreign_keys_pragmas_in_transactions[0].line, 5);
-    assert!(report.rebuilds.is_empty());
+    assert_eq!(report.foreign_keys_pragmas_in_transactions().len(), 1);
+    assert_eq!(report.foreign_keys_pragmas_in_transactions()[0].line, 5);
+    assert!(report.rebuilds().is_empty());
 }
 
 #[test]
@@ -198,8 +199,8 @@ SELECT 1;
 ALTER TABLE main.__NEW_USERS RENAME TO [users];
 "#;
     let report = scan_sql(sql);
-    assert_eq!(report.rebuilds.len(), 1);
-    let rebuild = &report.rebuilds[0];
+    assert_eq!(report.rebuilds().len(), 1);
+    let rebuild = &report.rebuilds()[0];
     assert_eq!(rebuild.temporary_table, "main.__new_users");
     assert_eq!(rebuild.original_table, "main.users");
     assert_eq!(
@@ -226,9 +227,9 @@ DROP TABLE IF EXISTS a;
 ALTER TABLE __new_a RENAME TO a;
 "#;
     let report = scan_sql(sql);
-    assert_eq!(report.rebuilds.len(), 2);
-    assert_eq!(report.rebuilds[0].original_table, "b");
-    assert_eq!(report.rebuilds[1].original_table, "a");
+    assert_eq!(report.rebuilds().len(), 2);
+    assert_eq!(report.rebuilds()[0].original_table, "b");
+    assert_eq!(report.rebuilds()[1].original_table, "a");
 }
 
 #[test]
@@ -239,7 +240,7 @@ INSERT INTO __new_t SELECT id FROM t;
 DROP TABLE t;
 ALTER TABLE __new_t RENAME COLUMN id TO other;
 "#;
-    assert!(scan_sql(rename_column).rebuilds.is_empty());
+    assert!(scan_sql(rename_column).rebuilds().is_empty());
 
     let out_of_order = r#"
 CREATE TABLE __new_t(id);
@@ -247,7 +248,7 @@ INSERT INTO __new_t SELECT id FROM t;
 ALTER TABLE __new_t RENAME TO t;
 DROP TABLE t;
 "#;
-    assert!(scan_sql(out_of_order).rebuilds.is_empty());
+    assert!(scan_sql(out_of_order).rebuilds().is_empty());
 
     let reused_steps = r#"
 CREATE TABLE __new_t(id);
@@ -256,7 +257,7 @@ CREATE TABLE __new_t(id, value);
 DROP TABLE t;
 ALTER TABLE __new_t RENAME TO t;
 "#;
-    assert!(scan_sql(reused_steps).rebuilds.is_empty());
+    assert!(scan_sql(reused_steps).rebuilds().is_empty());
 }
 
 #[test]
@@ -268,8 +269,8 @@ INSERT INTO users SELECT id, name FROM users_old;
 DROP TABLE users_old;
 "#;
     let report = scan_sql(sql);
-    assert_eq!(report.rebuilds.len(), 1);
-    let rebuild = &report.rebuilds[0];
+    assert_eq!(report.rebuilds().len(), 1);
+    let rebuild = &report.rebuilds()[0];
     assert_eq!(rebuild.kind, RebuildKind::RenameAway);
     assert_eq!(rebuild.original_table, "users");
     assert_eq!(rebuild.temporary_table, "users_old");
@@ -290,14 +291,14 @@ INSERT INTO users SELECT id, name FROM users_old;
 ALTER TABLE users RENAME TO users_old;
 DROP TABLE users_old;
 "#;
-    assert!(scan_sql(copied_before_the_rename).rebuilds.is_empty());
+    assert!(scan_sql(copied_before_the_rename).rebuilds().is_empty());
 
     let nothing_copied = r#"
 ALTER TABLE users RENAME TO users_old;
 CREATE TABLE users(id INTEGER, name TEXT);
 DROP TABLE users_old;
 "#;
-    assert!(scan_sql(nothing_copied).rebuilds.is_empty());
+    assert!(scan_sql(nothing_copied).rebuilds().is_empty());
 }
 
 #[test]
@@ -315,7 +316,7 @@ ALTER TABLE __new_t RENAME TO t;
     let report = scan_sql(sql);
     assert_eq!(
         report
-            .rebuilds
+            .rebuilds()
             .iter()
             .map(|rebuild| (rebuild.kind, rebuild.drop_line))
             .collect::<Vec<_>>(),
@@ -335,9 +336,9 @@ fn a_with_clause_is_part_of_the_copy_only_in_an_insert() {
             "CREATE TABLE __new_t(id);\n{copy};\nDROP TABLE t;\nALTER TABLE __new_t RENAME TO t;"
         );
         let report = scan_sql(&sql);
-        assert_eq!(report.rebuilds.len(), 1, "{copy}");
-        assert_eq!(report.rebuilds[0].original_table, "t", "{copy}");
-        assert_eq!(report.rebuilds[0].copy_line, 2, "{copy}");
+        assert_eq!(report.rebuilds().len(), 1, "{copy}");
+        assert_eq!(report.rebuilds()[0].original_table, "t", "{copy}");
+        assert_eq!(report.rebuilds()[0].copy_line, 2, "{copy}");
     }
 
     for not_a_copy in [
@@ -348,7 +349,7 @@ fn a_with_clause_is_part_of_the_copy_only_in_an_insert() {
         let sql = format!(
             "CREATE TABLE __new_t(id);\n{not_a_copy};\nDROP TABLE t;\nALTER TABLE __new_t RENAME TO t;"
         );
-        assert!(scan_sql(&sql).rebuilds.is_empty(), "{not_a_copy}");
+        assert!(scan_sql(&sql).rebuilds().is_empty(), "{not_a_copy}");
     }
 }
 
@@ -363,8 +364,8 @@ fn create_table_as_select_is_the_creation_and_the_copy() {
     ] {
         let sql = format!("{copy};\nDROP TABLE t;\nALTER TABLE __new_t RENAME TO t;");
         let report = scan_sql(&sql);
-        assert_eq!(report.rebuilds.len(), 1, "{copy}");
-        let rebuild = &report.rebuilds[0];
+        assert_eq!(report.rebuilds().len(), 1, "{copy}");
+        let rebuild = &report.rebuilds()[0];
         assert_eq!(rebuild.kind, RebuildKind::Rename, "{copy}");
         assert_eq!(rebuild.original_table, "t", "{copy}");
         assert_eq!(
@@ -386,7 +387,7 @@ fn create_table_as_select_is_the_creation_and_the_copy() {
         "CREATE VIEW __new_t AS SELECT id FROM t",
     ] {
         let sql = format!("{not_a_copy};\nDROP TABLE t;\nALTER TABLE __new_t RENAME TO t;");
-        assert!(scan_sql(&sql).rebuilds.is_empty(), "{not_a_copy}");
+        assert!(scan_sql(&sql).rebuilds().is_empty(), "{not_a_copy}");
     }
 }
 
@@ -399,8 +400,8 @@ CREATE TABLE t AS SELECT id FROM held;
 DROP TABLE held;
 "#;
     let report = scan_sql(sql);
-    assert_eq!(report.rebuilds.len(), 1);
-    let rebuild = &report.rebuilds[0];
+    assert_eq!(report.rebuilds().len(), 1);
+    let rebuild = &report.rebuilds()[0];
     assert_eq!(rebuild.kind, RebuildKind::Recreate);
     assert_eq!(rebuild.original_table, "t");
     assert_eq!(rebuild.temporary_table, "held");
@@ -419,7 +420,7 @@ CREATE TABLE held AS SELECT id FROM t;
 DROP TABLE t;
 CREATE TABLE t AS SELECT id FROM u;
 "#;
-    assert!(scan_sql(filled_from_another_table).rebuilds.is_empty());
+    assert!(scan_sql(filled_from_another_table).rebuilds().is_empty());
 }
 
 #[test]
@@ -430,8 +431,8 @@ CREATE TABLE t AS SELECT id FROM t_old;
 DROP TABLE t_old;
 "#;
     let report = scan_sql(sql);
-    assert_eq!(report.rebuilds.len(), 1);
-    let rebuild = &report.rebuilds[0];
+    assert_eq!(report.rebuilds().len(), 1);
+    let rebuild = &report.rebuilds()[0];
     assert_eq!(rebuild.kind, RebuildKind::RenameAway);
     assert_eq!(rebuild.original_table, "t");
     assert_eq!(rebuild.dropped_table(), "t_old");
@@ -452,7 +453,7 @@ fn values_is_a_copy_only_when_it_reads_a_table() {
         let sql = format!(
             "CREATE TABLE __new_t(id);\n{copy};\nDROP TABLE t;\nALTER TABLE __new_t RENAME TO t;"
         );
-        scan_sql(&sql).rebuilds
+        scan_sql(&sql).rebuilds().to_vec()
     };
 
     for copy in [

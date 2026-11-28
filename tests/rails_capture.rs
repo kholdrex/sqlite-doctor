@@ -12,8 +12,8 @@ fn rails_add_foreign_key_capture_reports_cascade_loss_at_the_drop() {
     let sql = include_str!("fixtures/rails_8_1_add_foreign_key.sql");
     let report = scan_sql(sql);
 
-    assert_eq!(report.rebuilds.len(), 1);
-    let rebuild = &report.rebuilds[0];
+    assert_eq!(report.rebuilds().len(), 1);
+    let rebuild = &report.rebuilds()[0];
     assert_eq!(rebuild.kind, RebuildKind::Recreate);
     assert_eq!(rebuild.temporary_table, "aparents");
     assert_eq!(rebuild.original_table, "parents");
@@ -31,7 +31,7 @@ fn rails_add_foreign_key_capture_reports_cascade_loss_at_the_drop() {
 fn rails_rebuild_without_cascading_dependents_is_not_reported_as_data_loss() {
     let sql = include_str!("fixtures/rails_8_1_change_default_control.sql");
 
-    assert_eq!(scan_sql(sql).rebuilds.len(), 1);
+    assert_eq!(scan_sql(sql).rebuilds().len(), 1);
     assert!(
         diagnose(&scan_sql(sql))
             .iter()
@@ -57,8 +57,8 @@ fn three_rails_rebuilds_of_one_table_report_each_cascade_and_no_lost_index() {
     let sql = include_str!("fixtures/rails_8_1_three_rebuilds_of_one_table.sql");
     let report = scan_sql(sql);
 
-    assert_eq!(report.rebuilds.len(), 3);
-    for rebuild in &report.rebuilds {
+    assert_eq!(report.rebuilds().len(), 3);
+    for rebuild in report.rebuilds() {
         assert_eq!(rebuild.kind, RebuildKind::Recreate);
         assert_eq!(rebuild.original_table, "parents");
     }
@@ -89,7 +89,7 @@ DROP TABLE posts;
 CREATE TABLE posts (id integer, title text);
 "#;
 
-    assert!(scan_sql(sql).rebuilds.is_empty());
+    assert!(scan_sql(sql).rebuilds().is_empty());
     assert!(codes(sql).is_empty());
 }
 
@@ -108,7 +108,7 @@ DROP TABLE ausers;
 "#;
 
     let report = scan_sql(sql);
-    assert_eq!(report.rebuilds[0].kind, RebuildKind::Recreate);
+    assert_eq!(report.rebuilds()[0].kind, RebuildKind::Recreate);
     assert_eq!(codes(sql), vec![("SQLD003", 6)]);
 }
 
@@ -165,8 +165,8 @@ fn a_backup_copy_does_not_hide_the_rebuild_that_drops_the_same_table() {
     let sql = include_str!("fixtures/backup_copy_beside_rebuild.sql");
     let report = scan_sql(sql);
 
-    assert_eq!(report.rebuilds.len(), 1);
-    assert_eq!(report.rebuilds[0].temporary_table, "__new_users");
+    assert_eq!(report.rebuilds().len(), 1);
+    assert_eq!(report.rebuilds()[0].temporary_table, "__new_users");
     assert_eq!(codes(sql), vec![("SQLD001", 11), ("SQLD003", 11)]);
 }
 
@@ -185,8 +185,8 @@ INSERT INTO parents SELECT id FROM aparents;
 "#;
     let report = scan_sql(sql);
 
-    assert_eq!(report.rebuilds.len(), 1);
-    assert_eq!(report.rebuilds[0].temporary_table, "aparents");
+    assert_eq!(report.rebuilds().len(), 1);
+    assert_eq!(report.rebuilds()[0].temporary_table, "aparents");
     assert_eq!(codes(sql), vec![("SQLD001", 8)]);
 }
 
@@ -194,7 +194,7 @@ INSERT INTO parents SELECT id FROM aparents;
 fn copying_a_table_into_itself_is_not_a_rebuild() {
     let sql = include_str!("fixtures/self_copy_is_not_a_rebuild.sql");
 
-    assert!(scan_sql(sql).rebuilds.is_empty());
+    assert!(scan_sql(sql).rebuilds().is_empty());
     assert!(codes(sql).is_empty());
 }
 
@@ -202,7 +202,7 @@ fn copying_a_table_into_itself_is_not_a_rebuild() {
 fn a_temp_table_shadowing_the_original_can_hold_its_rows() {
     let sql = include_str!("fixtures/temp_table_shadows_original.sql");
 
-    assert_eq!(scan_sql(sql).rebuilds.len(), 1);
+    assert_eq!(scan_sql(sql).rebuilds().len(), 1);
     assert_eq!(codes(sql), vec![("SQLD001", 9), ("SQLD003", 9)]);
 }
 
@@ -210,7 +210,7 @@ fn a_temp_table_shadowing_the_original_can_hold_its_rows() {
 fn two_holding_copies_of_one_dropped_table_report_one_rebuild() {
     let sql = include_str!("fixtures/two_holding_copies_one_rebuild.sql");
 
-    assert_eq!(scan_sql(sql).rebuilds.len(), 1);
+    assert_eq!(scan_sql(sql).rebuilds().len(), 1);
     assert_eq!(codes(sql), vec![("SQLD001", 11), ("SQLD003", 11)]);
 }
 
@@ -225,7 +225,7 @@ fn a_qualified_self_copy_does_not_consume_the_rebuild_candidate() {
 fn a_qualified_self_copy_is_not_a_rebuild() {
     let sql = include_str!("fixtures/qualified_self_copy_is_not_a_rebuild.sql");
 
-    assert!(scan_sql(sql).rebuilds.is_empty());
+    assert!(scan_sql(sql).rebuilds().is_empty());
     assert!(codes(sql).is_empty());
 }
 

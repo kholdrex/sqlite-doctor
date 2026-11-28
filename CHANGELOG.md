@@ -6,6 +6,33 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-28
+
+First release on crates.io: `cargo install sqlite-doctor`. The command-line
+tool and its JSON output are unchanged; the library API changed.
+
+### Added
+
+- `check_sql`, which scans SQL and returns its findings in one call.
+- Crate documentation with an example.
+
+### Changed
+
+- `HazardId`, `RebuildKind`, `SchemaObjectKind` and `DeleteAction` are
+  `#[non_exhaustive]`, so a later version can add a hazard or a variant
+  without fields without a breaking change. Matches on them need a wildcard
+  arm; use `HazardId::code` rather than an integer cast.
+- `Finding` and the scan records (`RebuildSequence`, `SchemaObject`,
+  `DroppedSchemaObject`, `DeleteActionReference`,
+  `ForeignKeysPragmaInTransaction`) are `#[non_exhaustive]`: their fields can
+  still be read, but code outside the crate cannot build them with a struct
+  literal.
+- `ScanReport` fields are private; the five that were public are read through
+  methods of the same names, which return slices. `ScanReport` no longer
+  implements `Default`: a report comes only from `scan_sql`.
+- `HazardId::ALL` is a slice instead of a three-element array.
+- `Finding::new` and `Finding::with_related_line` are no longer public.
+
 ## [0.1.0] - 2026-11-28
 
 First public release. The tags `study-original` and `study-relint` mark earlier
@@ -32,8 +59,9 @@ builds used in the research paper; they are not releases.
 
 ### Known gaps
 
-The README lists the inputs this version does not read correctly under
-"Known gaps in 0.1.0".
+The "Known gaps" item under Limits in the README lists the inputs this
+version does not read correctly.
 
-[Unreleased]: https://github.com/kholdrex/sqlite-doctor/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/kholdrex/sqlite-doctor/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/kholdrex/sqlite-doctor/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/kholdrex/sqlite-doctor/releases/tag/v0.1.0
