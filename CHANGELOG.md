@@ -6,10 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.3.0-rc.1] - 2026-11-28
+## [0.3.0] - 2026-11-28
 
-Release candidate: the first release built by `dist`, to check the release
-archives, the GitHub Action and the smoke checks before 0.3.0.
+Adds a contract for migration adapters and installable release archives.
+The documented library API is unchanged from 0.2.0.
 
 ### Added
 
@@ -41,6 +41,12 @@ archives, the GitHub Action and the smoke checks before 0.3.0.
   SQLite, such as `$p(/*)`) no longer hides the statements after it.
 - The Rails capture puts each header note on one line, so a table name with
   a line break cannot turn the note into SQL.
+
+## [0.3.0-rc.1] - 2026-11-28
+
+Release candidate for 0.3.0, with the same changes. Its release run built
+both archives and passed the smoke checks through the Action and
+`cargo binstall` on Linux and macOS.
 
 ## [0.2.0] - 2026-11-28
 
@@ -98,7 +104,8 @@ builds used in the research paper; they are not releases.
 The "Known gaps" item under Limits in the README lists the inputs this
 version does not read correctly.
 
-[Unreleased]: https://github.com/kholdrex/sqlite-doctor/compare/v0.3.0-rc.1...HEAD
+[Unreleased]: https://github.com/kholdrex/sqlite-doctor/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/kholdrex/sqlite-doctor/compare/v0.2.0...v0.3.0
 [0.3.0-rc.1]: https://github.com/kholdrex/sqlite-doctor/compare/v0.2.0...v0.3.0-rc.1
 [0.2.0]: https://github.com/kholdrex/sqlite-doctor/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/kholdrex/sqlite-doctor/releases/tag/v0.1.0
