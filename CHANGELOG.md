@@ -37,6 +37,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `sqlite-doctor-drizzle` 0.1.1 names the capture file next to each finding
+  only when `--output` keeps it; it used to name the temporary file the check
+  had already removed.
 - The `sqlite_doctor` gem 0.4.1 counts rows in the main schema, so a TEMP
   table a migration creates under the same name no longer hides rows lost on
   the copy, and `BASE` finds the schema and migration files when

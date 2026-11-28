@@ -63,10 +63,11 @@ test("a pending rebuild is reported at its file lines and the database is left a
 
   assert.equal(status, 1, output);
   assert.match(output, /1 pending migration\(s\):\n {2}drizzle\/0001_name_required\.sql/);
-  assert.match(output, /SQLD001: .*\n {2}--> drizzle\/0001_name_required\.sql:8 /);
-  assert.match(output, /SQLD002: .*\n {2}--> drizzle\/0001_name_required\.sql:1 /);
-  assert.match(output, /SQLD002: .*\n {2}--> drizzle\/0001_name_required\.sql:10 /);
+  assert.match(output, /SQLD001: .*\n {2}--> drizzle\/0001_name_required\.sql:8\n/);
+  assert.match(output, /SQLD002: .*\n {2}--> drizzle\/0001_name_required\.sql:1\n/);
+  assert.match(output, /SQLD002: .*\n {2}--> drizzle\/0001_name_required\.sql:10\n/);
   assert.match(output, /Rows lost on the copy: children: 1 -> 0/);
+  assert.doesNotMatch(output, /capture\.sql/);
   const db = new Database(path.join(root, "app.db"), { readonly: true });
   assert.equal(db.prepare("SELECT count(*) FROM children").pluck().get(), 1);
   assert.equal(db.prepare("SELECT count(*) FROM __drizzle_migrations").pluck().get(), 1);
@@ -101,7 +102,7 @@ test("base builds the database from the migrations at a revision of a repository
   assert.equal(status, 1, output);
   assert.match(output, /Checking against the migrations at HEAD/);
   assert.match(output, /1 pending migration\(s\):\n {2}drizzle\/0001_name_required\.sql/);
-  assert.match(output, /SQLD001: .*\n {2}--> drizzle\/0001_name_required\.sql:8 /);
+  assert.match(output, /SQLD001: .*\n {2}--> drizzle\/0001_name_required\.sql:8\n/);
   assert.equal(fs.existsSync(path.join(root, "app.db")), false);
 });
 
