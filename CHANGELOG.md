@@ -6,6 +6,37 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Comment directives for migration adapters: `-- sqlite-doctor:file`,
+  `migration` and `synthetic` say where the following lines came from, and
+  `-- sqlite-doctor:incomplete` marks a check that did not see everything.
+- JSON output: `location` and `related_location` on each finding, and
+  top-level `complete` and `incomplete`. Existing fields are unchanged.
+- Release archives for Linux x86_64 and macOS arm64 with SHA-256 checksums,
+  built by `dist`, and a GitHub Action (`kholdrex/sqlite-doctor@v<version>`)
+  that installs one after checking its checksum. Each release installs the
+  archives through the Action and through `cargo binstall` on both platforms
+  and runs smoke checks.
+- The Rails capture marks itself incomplete (`-- sqlite-doctor:incomplete`)
+  when a migration raised, a statement failed, SQL ran on a second
+  connection to the copy, the migrating connection reconnected, or copied SQL
+  has a line starting with `-- sqlite-doctor:`, so scanning a saved capture
+  exits `2`.
+
+### Changed
+
+- Exit code `2` also means an incomplete check, including an unknown or
+  malformed directive and input that ends inside a string, quoted name or
+  block comment. The findings are still printed.
+
+### Fixed
+
+- A named parameter whose `(...)` suffix holds `/*`, a quote or `[` (legal in
+  SQLite, such as `$p(/*)`) no longer hides the statements after it.
+- The Rails capture puts each header note on one line, so a table name with
+  a line break cannot turn the note into SQL.
+
 ## [0.2.0] - 2026-11-28
 
 First release on crates.io: `cargo install sqlite-doctor`. The command-line

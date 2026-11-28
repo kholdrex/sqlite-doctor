@@ -3,6 +3,7 @@ use std::io::{self, Read};
 use std::process::ExitCode;
 
 use serde_json::json;
+use sqlite_doctor::directives::{Directives, Location};
 use sqlite_doctor::{Finding, HazardId, check_sql};
 
 #[derive(Clone, Copy)]
@@ -57,12 +58,16 @@ fn run(arguments: Vec<String>) -> Result<u8, String> {
     let source = source.ok_or_else(|| "provide a SQL file or `-` for stdin".to_string())?;
     let sql = read_source(&source)?;
     let findings = check_sql(&sql);
+    let directives = Directives::parse(&sql);
 
     match format {
-        OutputFormat::Human => print_human(&source, &findings),
-        OutputFormat::Json => print_json(&source, &findings),
+        OutputFormat::Human => print_human(&source, &findings, &directives),
+        OutputFormat::Json => print_json(&source, &findings, &directives),
     }
 
+    if !directives.incomplete.is_empty() {
+        return Ok(2);
+    }
     Ok(u8::from(!findings.is_empty()))
 }
 
@@ -86,10 +91,9 @@ fn read_source(source: &str) -> Result<String, String> {
     }
 }
 
-fn print_human(source: &str, findings: &[Finding]) {
+fn print_human(source: &str, findings: &[Finding], directives: &Directives) {
     if findings.is_empty() {
         println!("No findings.");
-        return;
     }
 
     for (index, finding) in findings.iter().enumerate() {
@@ -97,13 +101,39 @@ fn print_human(source: &str, findings: &[Finding]) {
             println!();
         }
         println!("{}", finding.hazard);
-        println!("  --> {source}:{}", finding.line);
+        if directives.is_mapped() {
+            let location = directives.locate(source, finding.line);
+            let origin = match (location.line, location.synthetic) {
+                (_, true) => format!("{}, added by the migration runner", location.source),
+                (Some(line), false) => format!("{}:{line}", location.source),
+                (None, false) => location.source,
+            };
+            println!("  --> {origin} ({source}:{})", finding.line);
+        } else {
+            println!("  --> {source}:{}", finding.line);
+        }
         println!("  {}", finding.detail);
         println!("  help: {}", finding.remediation);
     }
+
+    if !directives.incomplete.is_empty() {
+        println!();
+        println!("Check incomplete:");
+        for (line, reason) in &directives.incomplete {
+            println!("- {source}:{line}: {reason}");
+        }
+    }
 }
 
-fn print_json(source: &str, findings: &[Finding]) {
+fn print_json(source: &str, findings: &[Finding], directives: &Directives) {
+    let location = |line: usize| {
+        let Location {
+            source,
+            line,
+            synthetic,
+        } = directives.locate(source, line);
+        json!({ "source": source, "line": line, "synthetic": synthetic })
+    };
     let findings: Vec<_> = findings
         .iter()
         .map(|finding| {
@@ -112,14 +142,23 @@ fn print_json(source: &str, findings: &[Finding]) {
                 "title": finding.hazard.title(),
                 "line": finding.line,
                 "related_line": finding.related_line,
+                "location": location(finding.line),
+                "related_location": finding.related_line.map(location),
                 "detail": finding.detail,
                 "remediation": finding.remediation,
             })
         })
         .collect();
+    let incomplete: Vec<_> = directives
+        .incomplete
+        .iter()
+        .map(|(line, reason)| json!({ "line": line, "reason": reason }))
+        .collect();
     let output = json!({
         "version": 1,
         "source": source,
+        "complete": incomplete.is_empty(),
+        "incomplete": incomplete,
         "findings": findings,
     });
     println!("{output:#}");
@@ -131,6 +170,9 @@ fn print_help() {
         "Checks SQLite migration SQL for table rebuilds that can delete or change dependent rows,"
     );
     println!("or drop indexes and triggers.");
+    println!();
+    println!("Exit codes: 0 no findings, 1 findings, 2 usage error, unreadable input or an");
+    println!("incomplete check (see the README for its causes).");
     println!();
     println!("Diagnostics:");
     for hazard in HazardId::ALL {

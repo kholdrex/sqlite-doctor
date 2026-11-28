@@ -21,6 +21,9 @@ require "tmpdir"
 module SqliteDoctorCapture
   SIDE_FILES = ["", "-wal", "-shm", "-journal"].freeze
   CAPTURE_HEADER = "-- sqlite-doctor capture:".freeze
+  # A line sqlite-doctor could read as a directive. Copied SQL is never
+  # rewritten, because the same text can sit inside a quoted name.
+  RESERVED_LINE = /^[ \t\f\r\u{feff}]*-- sqlite-doctor:/
 
   module_function
 
@@ -60,7 +63,8 @@ module SqliteDoctorCapture
         # and not when WAL frames are checkpointed (except TRUNCATE).
         watcher = SQLite3::Database.new(database, readonly: true)
         version = watcher.get_first_value("PRAGMA data_version")
-        statements, failures, error = run_migrations(migrations_paths, copy_pool)
+        statements, failures, error, other_connection, reconnected =
+          run_migrations(migrations_paths, copy_pool, connection)
         rows_after = row_counts(base_connection)
         if watcher.get_first_value("PRAGMA data_version") != version
           raise "#{database} changed while migrating the copy: a migration, model or " \
@@ -73,21 +77,54 @@ module SqliteDoctorCapture
 
       shrunk = rows_before.filter_map do |table, before|
         after = rows_after[table]
-        "#{table} #{before} -> #{after}" if after && after < before
+        "#{single_line(table)} #{before} -> #{after}" if after && after < before
       end
-      write_atomically(output, render(schema, foreign_keys, statements, failures, shrunk, error))
+      incomplete = []
+      incomplete << "the migration raised #{single_line("#{error.class}: #{error.message.lines.first&.strip}")}" if error
+      if failures.any?
+        incomplete << "#{failures.size} statement(s) failed; a failure can roll back earlier statements"
+      end
+      incomplete << "migration SQL ran on a second connection to the copy" if other_connection
+      if reconnected
+        incomplete << "the migrating connection reconnected, which resets PRAGMA foreign_keys without a trace"
+      end
+      copied = schema + statements.reject { |_, failed| failed }.map(&:first)
+      if copied.any? { |sql| sql.match?(RESERVED_LINE) }
+        incomplete << "copied SQL has a line that starts with `-- sqlite-doctor:`"
+      end
+      write_atomically(output, render(schema, foreign_keys, statements, failures, shrunk, error, incomplete))
       { output: output, statements: statements.size - failures.size, failed: failures.size,
         shrunk_tables: shrunk, error: error }
     end
   end
 
-  def run_migrations(migrations_paths, copy_pool)
+  # Records the SQL the migrating connection ran on the copy. SQL from
+  # another connection to the copy has its own transaction and PRAGMA state,
+  # so it is left out and the capture is marked incomplete.
+  # Rails sets PRAGMA foreign_keys on the raw connection whenever it
+  # reconnects, outside the notifications, so a reconnect is recorded.
+  def run_migrations(migrations_paths, copy_pool, migrating_connection)
     statements = []
     failures = []
+    other_connection = false
+    reconnected = false
+    watch_reconnects = Module.new do
+      define_method(:configure_connection) do |*arguments, **options, &block|
+        reconnected = true
+        super(*arguments, **options, &block)
+      end
+      private :configure_connection
+    end
+    migrating_connection.singleton_class.prepend(watch_reconnects)
     subscription = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
       next if payload[:cached]
       # SQL a migration sends to another database is not part of this trace.
       next unless payload[:connection]&.pool.equal?(copy_pool)
+
+      unless payload[:connection].equal?(migrating_connection)
+        other_connection = true
+        next
+      end
 
       # A failed statement did not change the schema, so it must not count as
       # restoring an object. Keep it visible as a comment.
@@ -96,9 +133,9 @@ module SqliteDoctorCapture
     end
     begin
       ActiveRecord::MigrationContext.new(Array(migrations_paths)).migrate
-      [statements, failures, nil]
+      [statements, failures, nil, other_connection, reconnected]
     rescue StandardError => e
-      [statements, failures, e]
+      [statements, failures, e, other_connection, reconnected]
     ensure
       ActiveSupport::Notifications.unsubscribe(subscription)
     end
@@ -226,12 +263,13 @@ module SqliteDoctorCapture
     end
   end
 
-  def render(schema, foreign_keys, statements, failures, shrunk, error)
+  def render(schema, foreign_keys, statements, failures, shrunk, error, incomplete)
     lines = []
     lines << "#{CAPTURE_HEADER} ActiveRecord #{ActiveRecord::VERSION::STRING}, " \
              "SQLite #{SQLite3::SQLITE_VERSION}"
     lines << "-- Migration target: temporary database copy."
-    lines << "-- Migration failed: #{error.class}: #{error.message.lines.first&.strip}" if error
+    lines << "-- Migration failed: #{single_line("#{error.class}: #{error.message.lines.first&.strip}")}" if error
+    incomplete.each { |reason| lines << "-- sqlite-doctor:incomplete #{reason}" }
     lines << "-- #{failures.size} statement(s) failed and are kept below as comments." if failures.any?
     shrunk.each { |line| lines << "-- Observed on the copy: rows in #{line}" }
     lines << ""
@@ -246,6 +284,10 @@ module SqliteDoctorCapture
       lines << (failed ? "-- failed: #{sql.gsub(/\s+/, ' ')}" : terminate(sql))
     end
     lines.join("\n") + "\n"
+  end
+
+  def single_line(text)
+    text.gsub(/[[:cntrl:]]+/, " ")
   end
 
   # SQLite ends a comment at the end of each statement it is given, but here

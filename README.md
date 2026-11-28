@@ -8,8 +8,18 @@ cargo install sqlite-doctor
 sqlite-doctor migration.sql
 ```
 
-Building needs Rust 1.88 or newer. Exit code `0` means nothing found, `1` means at least one finding, `2` means bad
-arguments or an unreadable file. Add `--format json` for CI, and pass `-` to read from stdin.
+Release archives for Linux x86_64 and macOS arm64, with SHA-256 checksums, are on the
+[releases page](https://github.com/kholdrex/sqlite-doctor/releases), and `cargo binstall sqlite-doctor` installs
+one without compiling. In GitHub Actions on those runners:
+
+```yaml
+- uses: kholdrex/sqlite-doctor@v0.3.0   # installs the 0.3.0 binary after checking its SHA-256
+- run: sqlite-doctor --format json migration.sql
+```
+
+Building from source needs Rust 1.88 or newer. Exit code `0` means nothing found, `1` means at least one finding,
+`2` means bad arguments, an unreadable file or an incomplete check (see
+[Directives](#directives-for-migration-adapters)). Add `--format json` for CI, and pass `-` to read from stdin.
 
 From Rust, `sqlite_doctor::check_sql` returns the same findings; see the [API docs](https://docs.rs/sqlite-doctor).
 
@@ -19,12 +29,16 @@ From Rust, `sqlite_doctor::check_sql` returns the same findings; see the [API do
 {
   "version": 1,
   "source": "migration.sql",
+  "complete": true,
+  "incomplete": [],
   "findings": [
     {
       "code": "SQLD003",
       "title": "table rebuild may drop an index or trigger",
       "line": 4,
       "related_line": 1,
+      "location": { "source": "migration.sql", "line": 4, "synthetic": false },
+      "related_location": { "source": "migration.sql", "line": 1, "synthetic": false },
       "detail": "...",
       "remediation": "..."
     }
@@ -33,9 +47,52 @@ From Rust, `sqlite_doctor::check_sql` returns the same findings; see the [API do
 ```
 
 `source` is the path as given, or `-` for stdin. `line` is the one-based line of the statement the finding is
-about, and `related_line` the line of the reference, index or trigger it concerns, or `null`. `code` and the
-meaning of each field are stable within `version` 1. Later releases may add codes and fields, so ignore the ones
-you don't know. `title`, `detail` and `remediation` are text for people and may be reworded in any release.
+about, and `related_line` the line of the reference, index or trigger it concerns, or `null`. `location` and
+`related_location` say where those lines came from (see below); without directives they repeat `source` and the
+line. `complete` is `false` when the input marks the check as incomplete, and `incomplete` lists each reason with
+its line. `code` and the meaning of each field are stable within `version` 1. Later releases may add codes and
+fields, so ignore the ones you don't know. `title`, `detail` and `remediation` are text for people and may be
+reworded in any release.
+
+## Directives for migration adapters
+
+A migration tool runs more SQL than its migration files hold: it opens the transaction, sets connection state and
+records the migration. An adapter that runs the migrations and hands the executed SQL to `sqlite-doctor` can mark
+where each line came from with comment lines, which SQLite ignores:
+
+| Directive | Following lines |
+| --- | --- |
+| `-- sqlite-doctor:file <line> <path>` | come from `<path>`, starting at line `<line>` |
+| `-- sqlite-doctor:migration <name>` | were recorded while migration `<name>` ran, with no file line |
+| `-- sqlite-doctor:synthetic <text>` | were added by the migration runner, for example its `BEGIN` and `COMMIT` |
+| `-- sqlite-doctor:incomplete <reason>` | (none) the check did not see everything, so the exit code is `2` |
+
+An origin directive applies until the next one, and directive lines are not counted as lines of the file. A
+directive is a line comment that starts its line, outside any string, quoted identifier or block comment; an unknown
+or malformed `-- sqlite-doctor:` directive makes the check incomplete. Directives only relabel locations or mark the
+check incomplete: no directive removes a finding. Findings are still printed for an incomplete check, but the exit
+code is `2`, so a wrapper must not treat that run as passing. Directives need sqlite-doctor 0.3.0 or newer: older
+versions read them as plain comments, so an adapter should check that the JSON output has a `complete` field.
+
+An adapter writes:
+
+- each argument on one line: replace line breaks and other control characters in a path, name or reason, or write
+  `incomplete` instead of a directive it cannot represent;
+- the starting schema, then the initial `PRAGMA foreign_keys` state of the connection that runs the migrations;
+- the statements that connection ran successfully, in order, including the runner's own transaction and `PRAGMA`
+  statements marked `synthetic`, each ended outside any comment (as `SqliteDoctorCapture.terminate` in
+  `contrib/rails` does) so a trailing comment cannot swallow what follows;
+- `incomplete` when the migration failed, a statement failed (SQLite can roll back the whole transaction on a
+  failure), a statement's outcome is unknown, a second connection ran migration SQL, or the pending migrations are
+  not known. No pending migrations is a complete check.
+
+A wrapper that pipes an adapter into `sqlite-doctor` must also fail when the adapter exits with an error: a capture
+cut short can look like a complete one. Input that ends inside a string, quoted name or block comment is reported
+as incomplete.
+
+A line comment in copied SQL that starts its line with `-- sqlite-doctor:` would be read as a directive. An adapter
+must not rewrite such lines by text alone, because the same text can sit inside a quoted name; the Rails capture
+leaves the SQL as it is and marks the check incomplete instead.
 
 ## Why this exists
 
@@ -93,11 +150,13 @@ inside it (which does nothing), and rebuilds the table through a holding copy.
 2. Run `bin/rails sqlite_doctor:capture OUTPUT=tmp/migration.sql`.
 3. Run `sqlite-doctor tmp/migration.sql`.
 
-The task points ActiveRecord at a `VACUUM INTO` copy of the primary database and runs your pending migrations
-there. The output holds the current schema, the `foreign_keys` setting and the SQL that ActiveRecord reported for
-that copy while the migrations ran. SQL that a migration sends to another database, or straight to the
-SQLite driver, is not in it. Failed statements are kept as comments. Tables that still exist but have fewer rows
-at the end are listed in the header.
+The task points ActiveRecord at a `VACUUM INTO` copy of the primary database and runs your pending migrations there.
+The output holds the current schema, the `foreign_keys` setting and the SQL that ActiveRecord reported for that copy
+while the migrations ran. SQL that a migration sends to another database, or straight to the SQLite driver, is not
+in it. Failed statements are kept as comments, and the capture is marked incomplete (exit code `2`) when a migration
+raised, a statement failed, SQL ran on a second connection to the copy, the migrating connection reconnected or
+copied SQL has a line starting with `-- sqlite-doctor:`. Tables that still exist but have fewer rows at the end are
+listed in the header.
 
 Before migrating, it refuses to start when:
 
@@ -196,10 +255,8 @@ builds.
   `DROP COLUMN` or a later rename leaves in place; a rename while `legacy_alter_table` is on but never set
   in the input, which is assumed off; either table renamed to an intermediate name during the rebuild; and an
   unqualified `ALTER TABLE ... ADD COLUMN` after `ATTACH` or after a rolled-back `CREATE TEMP TABLE` of that
-  name, which may be read as the wrong table. The Rails capture merges `PRAGMA foreign_keys` and transactions
-  from every connection on the copy, so a migration that uses a second connection can hide a finding. A
-  `CREATE TABLE IF NOT EXISTS` for a table that already exists is still
-  read as declaring its references, which can report a rebuild that loses nothing.
+  name, which may be read as the wrong table. A `CREATE TABLE IF NOT EXISTS` for a table that already exists is
+  still read as declaring its references, which can report a rebuild that loses nothing.
 
 ## Background
 
