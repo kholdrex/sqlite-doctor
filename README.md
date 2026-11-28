@@ -220,8 +220,42 @@ the `activerecord` and `sqlite3` gems installed. The capture code is tested on A
 
 ## Drizzle
 
-With better-sqlite3, Drizzle ORM 0.45.4 runs all pending migration files in one transaction, so a generated file
-alone hides the problem: its `PRAGMA foreign_keys=OFF` looks effective. Scan one input that matches what runs:
+With better-sqlite3, Drizzle ORM 0.45 runs all pending migration files in one transaction, so a generated file
+alone hides the problem: its `PRAGMA foreign_keys=OFF` looks effective. `sqlite-doctor-drizzle` runs the pending
+migrations with the project's own `drizzle-orm` migrator on a copy of the database, records every statement the
+connection executes, and checks that:
+
+```bash
+npm install --save-dev sqlite-doctor-drizzle
+npx sqlite-doctor-drizzle --database sqlite.db
+```
+
+It needs the `sqlite-doctor` binary, 0.3.0 or newer, on `PATH` or named by `SQLITE_DOCTOR`, and `drizzle-orm`
+0.45 with `better-sqlite3` in the project. Each finding names the migration file and line, for example
+`--> drizzle/0001_name_required.sql:8`. The exit codes are the binary's: `1` with findings, `2` when the check is
+incomplete or fails. The database file is only read; `--output capture.sql` keeps the captured SQL.
+
+In CI, name the commit the change starts from instead of a database. The database is then built by migrating an
+empty one with the migration files at that commit, so the pending migrations are the ones the change adds:
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0
+- uses: kholdrex/sqlite-doctor@v0.3.0
+- run: npx sqlite-doctor-drizzle --base "$BASE"
+  env:
+    BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+```
+
+That database has the schema but no rows, so a migration whose SQL depends on the rows it finds is not covered.
+Other options: `--migrations <dir>` (default `drizzle`), `--table <name>` for a custom migrations table, and
+`--foreign-keys off` if your migration script turns foreign keys off before calling `migrate()` (better-sqlite3
+turns them on). `drizzle-kit migrate` uses `@libsql/client` instead when it is installed, and libsql runs the
+migrations differently, so with `@libsql/client` in the project the check stops unless you pass
+`--driver better-sqlite3` to confirm that better-sqlite3 runs them. Other drivers and Drizzle 1.0 are not supported.
+
+Without the adapter, scan one input that matches what runs:
 
 1. The starting schema: `CREATE TABLE`, `CREATE INDEX` and `CREATE TRIGGER` statements.
 2. `PRAGMA foreign_keys = ON;` (better-sqlite3 turns foreign keys on by default).
@@ -320,6 +354,7 @@ cargo build
 AR_VERSION=8.1.4 ruby contrib/rails/test/capture_test.rb
 AR_VERSION=8.1.4 ruby contrib/rails/test/check_test.rb
 AR_VERSION=8.1.4 ruby contrib/rails/test/railtie_test.rb
+(cd contrib/drizzle && npm ci && npm test)
 ```
 
 Each file under `tests/fixtures/sqlite` is a script for the `sqlite3` shell, and its first line records what
