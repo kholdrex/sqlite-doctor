@@ -1,0 +1,61 @@
+name: release-smoke
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Released version to check, such as 0.3.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+        install: [action, binstall]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - id: version
+        shell: bash
+        env:
+          PLAN: ${{ inputs.plan }}
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PLAN" ]; then
+            tag=$(printf '%s' "$PLAN" | python3 -c 'import json, sys; print(json.load(sys.stdin)["announcement_tag"])')
+          else
+            tag="v${REQUESTED#v}"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$tag' is not a release tag"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ steps.version.outputs.tag }}
+          persist-credentials: false
+      - if: matrix.install == 'action'
+        uses: ./
+        with:
+          version: ${{ steps.version.outputs.version }}
+      - if: matrix.install == 'binstall'
+        uses: cargo-bins/cargo-binstall@v1.29.0
+      - if: matrix.install == 'binstall'
+        name: install the release archive, never a source build
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: cargo binstall "sqlite-doctor@$VERSION" --no-confirm --disable-strategies quick-install,compile
+      - run: sh tests/release_smoke.sh sqlite-doctor

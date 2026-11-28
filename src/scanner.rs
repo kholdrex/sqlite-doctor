@@ -634,7 +634,7 @@ struct Statement {
 }
 
 fn statements(sql: &str) -> Vec<Statement> {
-    let tokens = lex(sql);
+    let tokens = lex(sql).tokens;
     let mut result = Vec::new();
     let mut current = Vec::new();
     let mut is_trigger = false;
@@ -704,61 +704,126 @@ fn finish_statement(result: &mut Vec<Statement>, tokens: &mut Vec<Token>) {
     }
 }
 
-fn lex(sql: &str) -> Vec<Token> {
-    let mut result = Vec::new();
+/// What follows `--` in a directive comment.
+pub(crate) const DIRECTIVE_PREFIX: &str = " sqlite-doctor:";
+
+pub(crate) struct Lexed {
+    tokens: Vec<Token>,
+    /// Line comments that start their line, after only ASCII whitespace or
+    /// byte order marks, and begin with [`DIRECTIVE_PREFIX`]: their line and
+    /// the text after `--`.
+    pub(crate) standalone_comments: Vec<(usize, String)>,
+    /// Line of a string, quoted name or block comment the input ends inside.
+    pub(crate) unterminated: Option<usize>,
+}
+
+pub(crate) fn lex(sql: &str) -> Lexed {
+    let mut tokens = Vec::new();
+    let mut standalone_comments = Vec::new();
+    let mut unterminated = None;
     let mut line = 1usize;
+    let mut line_is_blank = true;
     let mut chars = sql.chars().peekable();
 
     while let Some(ch) = chars.next() {
         match ch {
-            '\n' => line += 1,
+            '\n' => {
+                line += 1;
+                line_is_blank = true;
+                continue;
+            }
             // Only ASCII whitespace and a byte-order mark separate tokens in
             // SQLite.
-            ch if ch.is_ascii_whitespace() || ch == '\u{feff}' => {}
+            ch if ch.is_ascii_whitespace() || ch == '\u{feff}' => continue,
             '-' if chars.peek() == Some(&'-') => {
                 chars.next();
+                let start_line = line;
+                let mut text = String::new();
                 for comment_ch in chars.by_ref() {
                     if comment_ch == '\n' {
                         line += 1;
                         break;
                     }
+                    if line_is_blank {
+                        text.push(comment_ch);
+                    }
                 }
+                if line_is_blank && text.starts_with(DIRECTIVE_PREFIX) {
+                    standalone_comments.push((start_line, text));
+                }
+                line_is_blank = true;
+                continue;
             }
             '/' if chars.peek() == Some(&'*') => {
                 chars.next();
+                let start_line = line;
                 let mut previous = '\0';
+                let mut closed = false;
                 for comment_ch in chars.by_ref() {
                     if comment_ch == '\n' {
                         line += 1;
                     }
                     if previous == '*' && comment_ch == '/' {
+                        closed = true;
                         break;
                     }
                     previous = comment_ch;
                 }
+                if !closed {
+                    unterminated.get_or_insert(start_line);
+                }
             }
-            '\'' => {
+            '\'' | '"' | '`' | '[' => {
                 let start_line = line;
-                let text = read_quoted(&mut chars, '\'', &mut line);
-                result.push(Token {
-                    kind: TokenKind::StringLiteral(text),
+                let delimiter = if ch == '[' { ']' } else { ch };
+                let (text, closed) = read_quoted(&mut chars, delimiter, &mut line);
+                if !closed {
+                    unterminated.get_or_insert(start_line);
+                }
+                let kind = if ch == '\'' {
+                    TokenKind::StringLiteral(text)
+                } else {
+                    TokenKind::QuotedIdentifier(text)
+                };
+                tokens.push(Token {
+                    kind,
                     line: start_line,
                 });
             }
-            '"' | '`' => {
-                let start_line = line;
-                let identifier = read_quoted(&mut chars, ch, &mut line);
-                result.push(Token {
-                    kind: TokenKind::QuotedIdentifier(identifier),
-                    line: start_line,
-                });
-            }
-            '[' => {
-                let start_line = line;
-                let identifier = read_quoted(&mut chars, ']', &mut line);
-                result.push(Token {
-                    kind: TokenKind::QuotedIdentifier(identifier),
-                    line: start_line,
+            // A named parameter: `$`, `@`, `:` or `#` and a name, which may
+            // hold `::` and end in a `(...)` suffix of any characters but
+            // whitespace. Quotes and comment markers in it are not special.
+            '$' | '@' | ':' | '#' if chars.peek().is_some_and(|next| is_word_character(*next)) => {
+                let mut parameter = String::from(ch);
+                loop {
+                    match chars.peek().copied() {
+                        Some(next) if is_word_character(next) => {
+                            parameter.push(next);
+                            chars.next();
+                        }
+                        Some(':') if chars.clone().nth(1) == Some(':') => {
+                            parameter.push_str("::");
+                            chars.next();
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                if chars.peek() == Some(&'(') {
+                    while let Some(&next) = chars.peek() {
+                        if next.is_ascii_whitespace() {
+                            break;
+                        }
+                        parameter.push(next);
+                        chars.next();
+                        if next == ')' {
+                            break;
+                        }
+                    }
+                }
+                tokens.push(Token {
+                    kind: TokenKind::Word(parameter),
+                    line,
                 });
             }
             ch if is_word_character(ch) => {
@@ -767,22 +832,33 @@ fn lex(sql: &str) -> Vec<Token> {
                 while chars.peek().is_some_and(|next| is_word_character(*next)) {
                     word.push(chars.next().expect("peeked character is present"));
                 }
-                result.push(Token {
+                tokens.push(Token {
                     kind: TokenKind::Word(word),
                     line: start_line,
                 });
             }
-            _ => result.push(Token {
+            _ => tokens.push(Token {
                 kind: TokenKind::Symbol(ch),
                 line,
             }),
         }
+        line_is_blank = false;
     }
 
-    result
+    Lexed {
+        tokens,
+        standalone_comments,
+        unterminated,
+    }
 }
 
-fn read_quoted<I>(chars: &mut std::iter::Peekable<I>, delimiter: char, line: &mut usize) -> String
+/// Reads up to the closing delimiter; a doubled delimiter is one character,
+/// except for `]`. Returns the text and whether the delimiter was found.
+fn read_quoted<I>(
+    chars: &mut std::iter::Peekable<I>,
+    delimiter: char,
+    line: &mut usize,
+) -> (String, bool)
 where
     I: Iterator<Item = char>,
 {
@@ -792,17 +868,17 @@ where
             *line += 1;
         }
         if ch == delimiter {
-            if chars.peek() == Some(&delimiter) {
+            if delimiter != ']' && chars.peek() == Some(&delimiter) {
                 chars.next();
                 text.push(delimiter);
             } else {
-                break;
+                return (text, true);
             }
         } else {
             text.push(ch);
         }
     }
-    text
+    (text, false)
 }
 
 fn is_word_character(ch: char) -> bool {

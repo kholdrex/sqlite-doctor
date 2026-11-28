@@ -75,6 +75,7 @@ class CaptureTest < Minitest::Test
     sql = File.read(@output)
 
     assert_nil result[:error]
+    refute_includes sql, "sqlite-doctor:incomplete"
     assert_equal before, original_digest
     assert_includes sql, "CREATE TABLE children"
     assert_includes sql, "PRAGMA foreign_keys = 1;"
@@ -332,9 +333,77 @@ class CaptureTest < Minitest::Test
     sql = File.read(@output)
 
     refute_nil result[:error]
+    assert_match(/^-- sqlite-doctor:incomplete the migration raised \S/, sql)
+    assert_match(/^-- sqlite-doctor:incomplete 1 statement\(s\) failed/, sql)
     assert_equal 1, result[:failed]
     assert_includes sql, "-- failed: CREATE UNIQUE INDEX idx_unique_name ON parents(name)"
     refute_match(/^CREATE UNIQUE INDEX idx_unique_name/, sql)
+  end
+
+  def test_a_rescued_failure_marks_the_capture_incomplete
+    migration(<<~RUBY)
+      begin
+        execute "INSERT INTO parents VALUES (1, 1, 'duplicate')"
+      rescue ActiveRecord::StatementInvalid
+        nil
+      end
+    RUBY
+
+    result = capture
+    sql = File.read(@output)
+
+    assert_nil result[:error]
+    assert_match(/^-- sqlite-doctor:incomplete 1 statement\(s\) failed/, sql)
+  end
+
+  def test_sql_from_a_second_connection_to_the_copy_marks_the_capture_incomplete
+    migration(<<~RUBY)
+      pool = ActiveRecord::Base.connection_pool
+      other = pool.checkout
+      begin
+        other.execute("PRAGMA foreign_keys = OFF")
+      ensure
+        pool.checkin(other)
+      end
+    RUBY
+
+    sql = File.read(capture[:output])
+
+    assert_match(/^-- sqlite-doctor:incomplete migration SQL ran on a second connection/, sql)
+    refute_includes sql, "PRAGMA foreign_keys = OFF"
+  end
+
+  def test_header_notes_stay_on_one_line
+    SQLite3::Database.new(@database) do |db|
+      db.execute_batch(%(CREATE TABLE "notes\narchive" (id INTEGER); INSERT INTO "notes\narchive" VALUES (1);))
+    end
+    migration(%(execute %(DELETE FROM "notes\\narchive")))
+
+    sql = File.read(capture[:output])
+
+    assert_includes sql, "-- Observed on the copy: rows in notes archive 1 -> 0"
+    refute(sql.lines.any? { |line| line.start_with?("archive 1 -> 0") })
+    refute_includes sql, "sqlite-doctor:incomplete"
+  end
+
+  def test_copied_sql_is_kept_byte_for_byte_and_a_reserved_line_marks_it_incomplete
+    name = %("p\n-- sqlite-doctor:example")
+    migration(<<~RUBY)
+      execute %(CREATE TABLE #{name.gsub("\n", "\\n")} (id INTEGER PRIMARY KEY))
+    RUBY
+
+    sql = File.read(capture[:output])
+
+    assert_includes sql, "CREATE TABLE #{name} (id INTEGER PRIMARY KEY)"
+    assert_match(/^-- sqlite-doctor:incomplete copied SQL has a line that starts with/, sql)
+  end
+
+  def test_a_reconnect_while_migrating_marks_the_capture_incomplete
+    migration("connection.reconnect!")
+
+    sql = File.read(capture[:output])
+
+    assert_match(/^-- sqlite-doctor:incomplete the migrating connection reconnected/, sql)
   end
 
   def test_never_follows_a_planted_staging_file

@@ -31,6 +31,8 @@
 
 use std::fmt;
 
+#[doc(hidden)]
+pub mod directives;
 mod scanner;
 
 use scanner::TableChangeKind;
