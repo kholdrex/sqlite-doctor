@@ -80,7 +80,7 @@ An adapter writes:
   `incomplete` instead of a directive it cannot represent;
 - the starting schema, then the initial `PRAGMA foreign_keys` state of the connection that runs the migrations;
 - the statements that connection ran successfully, in order, including the runner's own transaction and `PRAGMA`
-  statements marked `synthetic`, each ended outside any comment (as `SqliteDoctorCapture.terminate` in
+  statements marked `synthetic` or labelled with the migration they run for, each ended outside any comment (as `SqliteDoctor::Capture.terminate` in
   `contrib/rails` does) so a trailing comment cannot swallow what follows;
 - `incomplete` when the migration failed, a statement failed (SQLite can roll back the whole transaction on a
   failure), a statement's outcome is unknown, a second connection ran migration SQL, or the pending migrations are
@@ -146,17 +146,56 @@ ALTER TABLE __new_users RENAME TO users;
 A migration file doesn't show the SQL that matters: ActiveRecord opens the transaction, sets `foreign_keys = OFF`
 inside it (which does nothing), and rebuilds the table through a holding copy.
 
-1. Copy `contrib/rails/sqlite_doctor_capture.rb` and `contrib/rails/sqlite_doctor.rake` into `lib/tasks/`.
-2. Run `bin/rails sqlite_doctor:capture OUTPUT=tmp/migration.sql`.
-3. Run `sqlite-doctor tmp/migration.sql`.
+Add the gem (from GitHub until it is on RubyGems) and run the check:
 
-The task points ActiveRecord at a `VACUUM INTO` copy of the primary database and runs your pending migrations there.
-The output holds the current schema, the `foreign_keys` setting and the SQL that ActiveRecord reported for that copy
+```ruby
+gem "sqlite_doctor", github: "kholdrex/sqlite-doctor", group: [:development, :test]
+```
+
+```bash
+bin/rails sqlite_doctor:check
+```
+
+It needs the `sqlite-doctor` binary, 0.3.0 or newer, on `PATH` or named by `SQLITE_DOCTOR`. If the app itself fails
+to start, Rails ends the command before the check runs, with its own exit code. It prints each finding
+with the migration it came from. It exits `1` with findings and `2` when the check is incomplete or fails; when
+nothing is found it returns, so Rake tasks that depend on it still run. `OUTPUT=tmp/migration.sql` keeps the
+captured SQL; `bin/rails sqlite_doctor:capture OUTPUT=...` only writes it. An app that migrates more than one
+database in the current environment must name one with `DATABASE=<name>`; the others are not checked.
+
+In CI the database is usually migrated already, so nothing is pending. Name the commit the change starts from
+instead, from the GitHub event:
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0
+- uses: kholdrex/sqlite-doctor@v0.3.0
+- run: bin/rails sqlite_doctor:check
+  env:
+    BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+```
+
+On a push that creates a branch, `before` is all zeros and the check fails with exit code `2`; run it on pull
+requests or skip that case. With `BASE`, the database is built from the schema file (`db/schema.rb` or
+`db/structure.sql`) at that commit, and exactly the migration files present there count as applied, so the pending
+migrations are the ones the change adds, whatever their timestamps. The configured database is not used: the
+check refuses to run if another connection pool in the app is open on it, and fails if it changes while migrating,
+but a migration that connects to it on its own still writes to it.
+
+That database has the schema but no rows, so the check covers what the migration SQL does, not data. It misses a
+migration whose SQL depends on the rows it finds, and an index, trigger or view the schema file leaves out:
+`db/schema.rb` keeps no triggers or views, so use `structure.sql` if you rely on them. For those cases run the
+check without `BASE` on a copy of a database that has representative rows.
+
+The check points ActiveRecord at a `VACUUM INTO` copy of the database and runs your pending migrations there. The
+output holds the current schema, the `foreign_keys` setting and the SQL that ActiveRecord reported for that copy
 while the migrations ran. SQL that a migration sends to another database, or straight to the SQLite driver, is not
 in it. Failed statements are kept as comments, and the capture is marked incomplete (exit code `2`) when a migration
-raised, a statement failed, SQL ran on a second connection to the copy, the migrating connection reconnected or
-copied SQL has a line starting with `-- sqlite-doctor:`. Tables that still exist but have fewer rows at the end are
-listed in the header.
+raised, a statement failed, SQL ran on a second connection to the copy or on another database, the migrating
+connection reconnected or copied SQL has a line starting with `-- sqlite-doctor:`. Tables that still exist but have
+fewer rows at the end are listed in the header. The `sqlite3` gem must be the version your Rails needs (2.1 or newer
+for Rails 8); with another, the check exits with `2`.
 
 Before migrating, it refuses to start when:
 
@@ -176,7 +215,7 @@ A migration that opens its own connection to the original database is not redire
 database. The task notices afterwards (`PRAGMA data_version`) and fails without writing a capture. A concurrent
 `wal_checkpoint(TRUNCATE)` from another process trips the same check; run the task again.
 
-Without Rails, run `ruby contrib/rails/sqlite_doctor_capture.rb DATABASE MIGRATIONS_DIR OUTPUT` from a clone, with
+Without Rails, run `ruby contrib/rails/lib/sqlite_doctor/capture.rb DATABASE MIGRATIONS_DIR OUTPUT` from a clone, with
 the `activerecord` and `sqlite3` gems installed. The capture code is tested on ActiveRecord 7.1, 7.2 and 8.1.
 
 ## Drizzle
@@ -277,7 +316,10 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 sh tests/sqlite_outcomes.sh
+cargo build
 AR_VERSION=8.1.4 ruby contrib/rails/test/capture_test.rb
+AR_VERSION=8.1.4 ruby contrib/rails/test/check_test.rb
+AR_VERSION=8.1.4 ruby contrib/rails/test/railtie_test.rb
 ```
 
 Each file under `tests/fixtures/sqlite` is a script for the `sqlite3` shell, and its first line records what

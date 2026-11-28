@@ -10,24 +10,63 @@
 # resolved like ActiveRecord does: against Rails.root when Rails is loaded.
 #
 # Standalone:
-#   ruby sqlite_doctor_capture.rb DATABASE MIGRATIONS_DIR OUTPUT
-# In a Rails app, see sqlite_doctor.rake.
+#   ruby capture.rb DATABASE MIGRATIONS_DIR OUTPUT
+# In a Rails app, see lib/tasks/sqlite_doctor.rake.
 
 require "active_record"
 require "sqlite3"
 require "tempfile"
 require "tmpdir"
 
-module SqliteDoctorCapture
+module SqliteDoctor
+  # Names the migration whose SQL is being recorded, for the directives that
+  # point findings at their migration file.
+  # Acts only while a capture runs on this thread. Thread variables, unlike
+  # Thread.current[], are shared with fibers the migration starts.
+  module LabelMigrations
+    def self.capturing?
+      Thread.current.thread_variable_get(:sqlite_doctor_capturing)
+    end
+
+    def self.current
+      Thread.current.thread_variable_get(:sqlite_doctor_migration)
+    end
+
+    def self.labelled(migration)
+      previous = current
+      name = migration.respond_to?(:filename) ? migration.filename : migration.name
+      Thread.current.thread_variable_set(:sqlite_doctor_migration, name)
+      yield
+    ensure
+      Thread.current.thread_variable_set(:sqlite_doctor_migration, previous)
+    end
+
+    private
+
+    def execute_migration_in_transaction(migration)
+      return super unless SqliteDoctor::LabelMigrations.capturing?
+
+      SqliteDoctor::LabelMigrations.labelled(migration) { super }
+    end
+  end
+end
+
+module SqliteDoctor::Capture
   SIDE_FILES = ["", "-wal", "-shm", "-journal"].freeze
   CAPTURE_HEADER = "-- sqlite-doctor capture:".freeze
   # A line sqlite-doctor could read as a directive. Copied SQL is never
   # rewritten, because the same text can sit inside a quoted name.
   RESERVED_LINE = /^[ \t\f\r\u{feff}]*-- sqlite-doctor:/
 
+  # A capture that cannot run safely or cannot see what it needs.
+  class Refused < RuntimeError; end
+
   module_function
 
-  def capture(config:, migrations_paths:, output:)
+  # name and env_name keep the selected database's identity on the copy.
+  # watch: another file that must not change while migrating, such as the
+  # configured database when the capture runs on a substitute.
+  def capture(config:, migrations_paths:, output:, root: nil, name: nil, env_name: nil, watch: nil)
     database = resolve_database_path(config.fetch(:database).to_s)
     raise ArgumentError, "#{database} does not exist" unless File.file?(database)
     database = File.realpath(database)
@@ -36,6 +75,7 @@ module SqliteDoctorCapture
     reject_output_aliasing(database, output)
     reject_other_pools(database)
 
+    reject_in_memory_connection
     previous_config = current_db_config
     Dir.mktmpdir("sqlite-doctor") do |dir|
       copy = File.join(dir, File.basename(database))
@@ -44,11 +84,11 @@ module SqliteDoctorCapture
       end
 
       begin
-        ActiveRecord::Base.establish_connection(config.merge(database: copy))
+        ActiveRecord::Base.establish_connection(named_config(config.merge(database: copy), name, env_name))
         copy_pool = ActiveRecord::Base.connection_pool
         connection = base_connection
         unless main_database_path(connection) == File.realpath(copy)
-          raise "refusing to migrate: the connection is not attached to the copy"
+          raise Refused, "refusing to migrate: the connection is not attached to the copy"
         end
 
         schema = connection.select_values(<<~SQL)
@@ -61,17 +101,23 @@ module SqliteDoctorCapture
 
         # data_version changes when another connection commits to the file,
         # and not when WAL frames are checkpointed (except TRUNCATE).
-        watcher = SQLite3::Database.new(database, readonly: true)
-        version = watcher.get_first_value("PRAGMA data_version")
-        statements, failures, error, other_connection, reconnected =
-          run_migrations(migrations_paths, copy_pool, connection)
+        watchers = [database, watch].compact.uniq.map do |path|
+          watcher = SQLite3::Database.new(path, readonly: true)
+          [path, watcher, watcher.get_first_value("PRAGMA data_version")]
+        end
+        run = run_migrations(migrations_paths, copy_pool, connection)
+        statements = run[:statements]
+        failures = run[:failures]
+        error = run[:error]
         rows_after = row_counts(base_connection)
-        if watcher.get_first_value("PRAGMA data_version") != version
-          raise "#{database} changed while migrating the copy: a migration, model or " \
-                "other process committed to it (or ran a TRUNCATE checkpoint)"
+        watchers.each do |path, watcher, version|
+          next if watcher.get_first_value("PRAGMA data_version") == version
+
+          raise Refused, "#{path} changed while migrating the copy: a migration, model or " \
+                         "other process committed to it (or ran a TRUNCATE checkpoint)"
         end
       ensure
-        watcher&.close
+        watchers&.each { |_, watcher, _| watcher.close }
         restore_connection(previous_config)
       end
 
@@ -80,21 +126,25 @@ module SqliteDoctorCapture
         "#{single_line(table)} #{before} -> #{after}" if after && after < before
       end
       incomplete = []
-      incomplete << "the migration raised #{single_line("#{error.class}: #{error.message.lines.first&.strip}")}" if error
+      # The class only: messages such as StatementInvalid's quote SQL, which
+      # can hold data, and this reason is printed.
+      incomplete << "the migration raised #{error.class}" if error
       if failures.any?
         incomplete << "#{failures.size} statement(s) failed; a failure can roll back earlier statements"
       end
-      incomplete << "migration SQL ran on a second connection to the copy" if other_connection
-      if reconnected
+      incomplete << "migration SQL ran on a second connection to the copy" if run[:other_connection]
+      incomplete << "migration SQL ran on another database, which the capture does not record" if run[:other_database]
+      if run[:reconnected]
         incomplete << "the migrating connection reconnected, which resets PRAGMA foreign_keys without a trace"
       end
       copied = schema + statements.reject { |_, failed| failed }.map(&:first)
       if copied.any? { |sql| sql.match?(RESERVED_LINE) }
         incomplete << "copied SQL has a line that starts with `-- sqlite-doctor:`"
       end
-      write_atomically(output, render(schema, foreign_keys, statements, failures, shrunk, error, incomplete))
+      write_atomically(output, render(schema, foreign_keys, statements, failures, shrunk, error, incomplete, root))
       { output: output, statements: statements.size - failures.size, failed: failures.size,
-        shrunk_tables: shrunk, error: error }
+        pending: run[:pending]&.map { |name| relative_label(name, root) },
+        shrunk_tables: shrunk, error: error, incomplete: incomplete }
     end
   end
 
@@ -103,11 +153,16 @@ module SqliteDoctorCapture
   # so it is left out and the capture is marked incomplete.
   # Rails sets PRAGMA foreign_keys on the raw connection whenever it
   # reconnects, outside the notifications, so a reconnect is recorded.
+  # SQL this thread sends to any other database is not recorded either, so
+  # it also makes the capture incomplete. Migration announcements are
+  # suppressed: they print SQL, which can hold data.
   def run_migrations(migrations_paths, copy_pool, migrating_connection)
     statements = []
     failures = []
     other_connection = false
+    other_database = false
     reconnected = false
+    pending = nil
     watch_reconnects = Module.new do
       define_method(:configure_connection) do |*arguments, **options, &block|
         reconnected = true
@@ -116,10 +171,15 @@ module SqliteDoctorCapture
       private :configure_connection
     end
     migrating_connection.singleton_class.prepend(watch_reconnects)
+    ActiveRecord::Migrator.prepend(SqliteDoctor::LabelMigrations) unless ActiveRecord::Migrator < SqliteDoctor::LabelMigrations
     subscription = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
       next if payload[:cached]
-      # SQL a migration sends to another database is not part of this trace.
-      next unless payload[:connection]&.pool.equal?(copy_pool)
+
+      # From any thread: a migration may hand work to a thread of its own.
+      unless payload[:connection]&.pool.equal?(copy_pool)
+        other_database = true
+        next
+      end
 
       unless payload[:connection].equal?(migrating_connection)
         other_connection = true
@@ -129,16 +189,43 @@ module SqliteDoctorCapture
       # A failed statement did not change the schema, so it must not count as
       # restoring an object. Keep it visible as a comment.
       failures << payload[:sql] if payload[:exception]
-      statements << [payload[:sql], !payload[:exception].nil?]
+      statements << [payload[:sql], !payload[:exception].nil?, SqliteDoctor::LabelMigrations.current]
     end
+    Thread.current.thread_variable_set(:sqlite_doctor_capturing, true)
     begin
-      ActiveRecord::MigrationContext.new(Array(migrations_paths)).migrate
-      [statements, failures, nil, other_connection, reconnected]
+      context = ActiveRecord::MigrationContext.new(Array(migrations_paths))
+      pending = context.open.pending_migrations.map(&:filename)
+      ActiveRecord::Migration.suppress_messages { context.migrate }
+      error = nil
     rescue StandardError => e
-      [statements, failures, e, other_connection, reconnected]
+      error = e
     ensure
+      Thread.current.thread_variable_set(:sqlite_doctor_capturing, nil)
       ActiveSupport::Notifications.unsubscribe(subscription)
     end
+    { statements: statements, failures: failures, error: error, other_connection: other_connection,
+      other_database: other_database, reconnected: reconnected, pending: pending }
+  end
+
+  # Switching ActiveRecord::Base to the copy and back reconnects, which
+  # discards an in-memory database the caller is using.
+  def reject_in_memory_connection
+    previous_config = current_db_config
+    return unless previous_config
+
+    in_memory = pool_database_path(previous_config).nil?
+    # A connection opened with SQLite's MEMORY flag has a file-like setting.
+    in_memory ||= ActiveRecord::Base.connection_pool.connected? && main_database_path(base_connection).nil?
+    return unless in_memory
+
+    raise Refused, "the current connection uses an in-memory database, which switching connections would " \
+                   "discard; run against a file-backed configuration"
+  end
+
+  def named_config(config, name, env_name)
+    return config unless name
+
+    ActiveRecord::DatabaseConfigurations::HashConfig.new(env_name || "default_env", name, config)
   end
 
   def restore_connection(previous_config)
@@ -222,7 +309,7 @@ module SqliteDoctorCapture
       path = pool_database_path(pool.db_config)
       next unless path && File.exist?(path) && File.identical?(path, database)
 
-      raise "refusing to migrate: connection pool #{pool.db_config.name} also uses #{database}"
+      raise Refused, "refusing to migrate: connection pool #{pool.db_config.name} also uses #{database}"
     end
   end
 
@@ -237,7 +324,7 @@ module SqliteDoctorCapture
     if location.start_with?("//")
       authority, location = location[2..].split("/", 2)
       unless ["", "localhost"].include?(authority.to_s)
-        raise "refusing to migrate: cannot tell which file connection pool " \
+        raise Refused, "refusing to migrate: cannot tell which file connection pool " \
               "#{db_config.name} uses (#{path})"
       end
       location = "/#{location}"
@@ -263,7 +350,7 @@ module SqliteDoctorCapture
     end
   end
 
-  def render(schema, foreign_keys, statements, failures, shrunk, error, incomplete)
+  def render(schema, foreign_keys, statements, failures, shrunk, error, incomplete, root = nil)
     lines = []
     lines << "#{CAPTURE_HEADER} ActiveRecord #{ActiveRecord::VERSION::STRING}, " \
              "SQLite #{SQLite3::SQLITE_VERSION}"
@@ -274,13 +361,20 @@ module SqliteDoctorCapture
     shrunk.each { |line| lines << "-- Observed on the copy: rows in #{line}" }
     lines << ""
     lines << "-- Baseline schema"
+    lines << "-- sqlite-doctor:migration schema before migrating"
     schema.each { |sql| lines << terminate(sql) }
     lines << ""
     lines << "-- Connection state before migrating"
+    lines << "-- sqlite-doctor:synthetic connection state before migrating"
     lines << "PRAGMA foreign_keys = #{foreign_keys};"
     lines << ""
     lines << "-- Executed statements"
-    statements.each do |sql, failed|
+    current = :none
+    statements.each do |sql, failed, label|
+      if label != current
+        lines << (label ? "-- sqlite-doctor:migration #{relative_label(label, root)}" : "-- sqlite-doctor:synthetic ActiveRecord migrator")
+        current = label
+      end
       lines << (failed ? "-- failed: #{sql.gsub(/\s+/, ' ')}" : terminate(sql))
     end
     lines.join("\n") + "\n"
@@ -288,6 +382,16 @@ module SqliteDoctorCapture
 
   def single_line(text)
     text.gsub(/[[:cntrl:]]+/, " ")
+  end
+
+  # A migration file relative to the application root, on one line.
+  def relative_label(path, root = nil)
+    root ||= defined?(Rails) && Rails.respond_to?(:root) && Rails.root ? Rails.root.to_s : Dir.pwd
+    root = File.realpath(root) if File.directory?(root)
+    path = File.expand_path(path, root)
+    path = File.realpath(path) if File.exist?(path)
+    path = path.delete_prefix("#{root}/") if path.start_with?("#{root}/")
+    single_line(path)
   end
 
   # SQLite ends a comment at the end of each statement it is given, but here
@@ -342,7 +446,7 @@ if $PROGRAM_NAME == __FILE__
   database, migrations, output = ARGV
   abort "usage: ruby #{File.basename(__FILE__)} DATABASE MIGRATIONS_DIR OUTPUT" unless output
 
-  result = SqliteDoctorCapture.capture(
+  result = SqliteDoctor::Capture.capture(
     config: { adapter: "sqlite3", database: database },
     migrations_paths: migrations,
     output: output

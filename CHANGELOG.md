@@ -6,6 +6,30 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The Rails helper is a gem, `sqlite_doctor` (gemspec at the repository
+  root, code in `contrib/rails/lib`). `bin/rails sqlite_doctor:check` captures
+  the pending migrations, scans them with the `sqlite-doctor` binary (0.3.0
+  or newer), prints each finding with the migration it came from and exits
+  `1` with findings or `2` when the check is incomplete or fails.
+  `BASE=<git revision>` builds the database from the schema
+  file and migration files at that revision, so CI needs no migrated
+  database.
+- Rails captures mark which migration ran each statement with
+  `-- sqlite-doctor:migration` directives, and are incomplete when migration
+  SQL runs on another database.
+- `DATABASE=<name>` picks the database in an app that migrates several; without
+  it such an app gets exit code `2`.
+
+### Changed
+
+- Migration announcements are not printed during a capture, because they
+  show SQL that can hold data.
+- The Rails capture code moved from `contrib/rails/sqlite_doctor_capture.rb`
+  to `contrib/rails/lib/sqlite_doctor/capture.rb`, and its module from
+  `SqliteDoctorCapture` to `SqliteDoctor::Capture`.
+
 ## [0.3.0] - 2026-11-28
 
 Adds a contract for migration adapters and installable release archives.

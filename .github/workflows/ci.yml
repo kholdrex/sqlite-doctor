@@ -42,7 +42,20 @@ jobs:
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.3"
-      - name: capture helper tests
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build the sqlite-doctor binary
+        run: cargo build
+      - name: capture tests
         env:
           AR_VERSION: ${{ matrix.activerecord }}
         run: ruby contrib/rails/test/capture_test.rb
+      - name: check tests
+        env:
+          AR_VERSION: ${{ matrix.activerecord }}
+        run: ruby contrib/rails/test/check_test.rb
+      - name: Rails application tests
+        env:
+          AR_VERSION: ${{ matrix.activerecord }}
+        run: ruby contrib/rails/test/railtie_test.rb
+      - name: gem builds
+        run: gem build sqlite_doctor.gemspec

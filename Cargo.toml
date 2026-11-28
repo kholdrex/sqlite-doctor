@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/kholdrex/sqlite-doctor"
 keywords = ["sqlite", "migrations", "lint", "foreign-keys", "database"]
 categories = ["command-line-utilities", "database", "development-tools"]
-exclude = [".github/", "action.yml", "dist-workspace.toml"]
+exclude = [".github/", "action.yml", "dist-workspace.toml", "sqlite_doctor.gemspec"]
 
 [lib]
 name = "sqlite_doctor"

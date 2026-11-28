@@ -10,7 +10,7 @@ end
 
 require "minitest/autorun"
 require "tmpdir"
-require_relative "../sqlite_doctor_capture"
+require_relative "../lib/sqlite_doctor/capture"
 
 ActiveRecord::Migration.verbose = false
 
@@ -56,7 +56,7 @@ class CaptureTest < Minitest::Test
   end
 
   def capture
-    SqliteDoctorCapture.capture(
+    SqliteDoctor::Capture.capture(
       config: { adapter: "sqlite3", database: @database },
       migrations_paths: @migrations,
       output: @output
@@ -108,7 +108,7 @@ class CaptureTest < Minitest::Test
     capture
 
     assert_equal File.realpath(@database), File.realpath(ActiveRecord::Base.connection_db_config.database)
-    assert_equal 1, SqliteDoctorCapture.base_connection.select_value("SELECT count(*) FROM parents")
+    assert_equal 1, SqliteDoctor::Capture.base_connection.select_value("SELECT count(*) FROM parents")
   end
 
   def test_refuses_to_write_the_capture_over_the_database_or_its_side_files
@@ -117,7 +117,7 @@ class CaptureTest < Minitest::Test
 
     [@database, "#{@database}-wal"].each do |target|
       error = assert_raises(ArgumentError) do
-        SqliteDoctorCapture.capture(config: { adapter: "sqlite3", database: @database },
+        SqliteDoctor::Capture.capture(config: { adapter: "sqlite3", database: @database },
                                     migrations_paths: @migrations, output: target)
       end
       assert_match(/refusing to write/, error.message)
@@ -138,7 +138,7 @@ class CaptureTest < Minitest::Test
 
     ["#{queue}-wal", queue].each do |target|
       error = assert_raises(ArgumentError, target) do
-        SqliteDoctorCapture.capture(config: { adapter: "sqlite3", database: @database },
+        SqliteDoctor::Capture.capture(config: { adapter: "sqlite3", database: @database },
                                     migrations_paths: @migrations, output: target)
       end
       assert_match(/refusing to write the capture (over|to) .*#{Regexp.escape(File.basename(target))}/,
@@ -148,7 +148,7 @@ class CaptureTest < Minitest::Test
     ActiveRecord::Base.configurations = previous
     SecondaryRecord.establish_connection(adapter: "sqlite3", database: queue)
     error = assert_raises(ArgumentError) do
-      SqliteDoctorCapture.capture(config: { adapter: "sqlite3", database: @database },
+      SqliteDoctor::Capture.capture(config: { adapter: "sqlite3", database: @database },
                                   migrations_paths: @migrations, output: queue)
     end
     assert_match(/refusing to write/, error.message)
@@ -181,7 +181,7 @@ class CaptureTest < Minitest::Test
 
     [other, linked].each do |target|
       error = assert_raises(ArgumentError, target) do
-        SqliteDoctorCapture.capture(config: { adapter: "sqlite3", database: @database },
+        SqliteDoctor::Capture.capture(config: { adapter: "sqlite3", database: @database },
                                     migrations_paths: @migrations, output: target)
       end
       assert_match(target == linked ? /symbolic link/ : /not an earlier capture/, error.message)
@@ -192,12 +192,12 @@ class CaptureTest < Minitest::Test
     [File.join(@dir, "empty.sql"), File.join(@dir, "dangling.sql")].each_with_index do |target, index|
       index.zero? ? File.write(target, "") : File.symlink(File.join(@dir, "missing"), target)
       assert_raises(ArgumentError, target) do
-        SqliteDoctorCapture.capture(config: { adapter: "sqlite3", database: @database },
+        SqliteDoctor::Capture.capture(config: { adapter: "sqlite3", database: @database },
                                     migrations_paths: @migrations, output: target)
       end
     end
     error = assert_raises(ArgumentError) do
-      SqliteDoctorCapture.capture(config: { adapter: "sqlite3", database: @database },
+      SqliteDoctor::Capture.capture(config: { adapter: "sqlite3", database: @database },
                                   migrations_paths: @migrations,
                                   output: File.join(@dir, File.basename(@database).upcase))
     end
@@ -205,7 +205,7 @@ class CaptureTest < Minitest::Test
 
     capture
     capture
-    assert File.read(@output).start_with?(SqliteDoctorCapture::CAPTURE_HEADER)
+    assert File.read(@output).start_with?(SqliteDoctor::Capture::CAPTURE_HEADER)
   end
 
   def test_refuses_a_database_a_migration_creates_at_the_output
@@ -286,7 +286,7 @@ class CaptureTest < Minitest::Test
     SecondaryRecord.remove_connection
   end
 
-  def test_sql_sent_to_another_database_is_not_captured
+  def test_sql_sent_to_another_database_is_not_captured_and_marks_the_capture_incomplete
     SecondaryRecord.establish_connection(adapter: "sqlite3", database: File.join(@dir, "other.sqlite3"))
     migration(<<~RUBY)
       SecondaryRecord.connection_pool.with_connection do |connection|
@@ -308,6 +308,7 @@ class CaptureTest < Minitest::Test
     assert_includes sql, 'ALTER TABLE "parents" ADD "extra" text'
     refute_includes sql, "elsewhere"
     refute_includes sql, "PRAGMA foreign_keys = OFF"
+    assert_match(/^-- sqlite-doctor:incomplete migration SQL ran on another database/, sql)
   ensure
     SecondaryRecord.remove_connection
   end
@@ -406,6 +407,77 @@ class CaptureTest < Minitest::Test
     assert_match(/^-- sqlite-doctor:incomplete the migrating connection reconnected/, sql)
   end
 
+  def test_migration_output_is_suppressed_and_labels_survive_fibers
+    migration(<<~RUBY)
+      execute "SELECT 'customer-literal-probe'"
+      Fiber.new { add_foreign_key :parents, :tenants, column: :tenant_id }.resume
+    RUBY
+    ActiveRecord::Migration.verbose = true
+
+    out, = capture_io { capture }
+    sql = File.read(@output)
+
+    refute_includes out, "customer-literal-probe"
+    assert ActiveRecord::Migration.verbose
+    refute_includes sql, "sqlite-doctor:synthetic ActiveRecord migrator\nCREATE TABLE"
+    assert_match(%r{^-- sqlite-doctor:migration .*20260101000001_change\.rb$}, sql)
+  ensure
+    ActiveRecord::Migration.verbose = false
+  end
+
+  def test_the_migrator_hook_leaves_other_migrations_alone
+    migration("add_column :parents, :extra, :text")
+    capture
+    plain = Class.new(ActiveRecord::Migration[7.1]) { def change; end }.new("plain", 1)
+    ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+    pool = ActiveRecord::Base.connection_pool
+    owner = pool.respond_to?(:schema_migration) ? pool : ActiveRecord::Base.connection
+    ActiveRecord::Migrator.new(:up, [plain], owner.schema_migration, owner.internal_metadata).migrate
+  end
+
+  def test_refuses_to_replace_an_in_memory_connection
+    ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+    migration("add_column :parents, :extra, :text")
+
+    error = assert_raises(SqliteDoctor::Capture::Refused) { capture }
+    assert_match(/in-memory database/, error.message)
+  end
+
+  def test_pending_migrations_are_listed_and_unknown_when_discovery_fails
+    migration("add_column :parents, :extra, :text")
+    assert_equal ["20260101000001_change.rb"], capture[:pending].map { |name| File.basename(name) }
+
+    File.write(File.join(@migrations, "20260101000002_change.rb"), "class Change < ActiveRecord::Migration[7.1]; end")
+    result = capture
+    assert_nil result[:pending]
+    refute_nil result[:error]
+  end
+
+  def test_sql_from_a_worker_thread_on_another_database_marks_the_capture_incomplete
+    SecondaryRecord.establish_connection(adapter: "sqlite3", database: File.join(@dir, "other.sqlite3"))
+    migration(<<~RUBY)
+      Thread.new do
+        SecondaryRecord.connection_pool.with_connection { |connection| connection.execute("CREATE TABLE elsewhere (id INTEGER)") }
+      end.join
+    RUBY
+
+    capture
+
+    assert_match(/^-- sqlite-doctor:incomplete migration SQL ran on another database/, File.read(@output))
+  ensure
+    SecondaryRecord.remove_connection
+  end
+
+  def test_the_copy_keeps_the_selected_database_name
+    migration(%(raise "named \#{connection.pool.db_config.name}" unless connection.pool.db_config.name == "archive"))
+
+    result = SqliteDoctor::Capture.capture(config: { adapter: "sqlite3", database: @database },
+                                           migrations_paths: @migrations, output: @output,
+                                           name: "archive", env_name: "production")
+
+    assert_nil result[:error]
+  end
+
   def test_never_follows_a_planted_staging_file
     migration("add_column :parents, :extra, :text")
     before = original_digest
@@ -434,8 +506,8 @@ class CaptureTest < Minitest::Test
     migration("add_column :parents, :extra, :text")
     before = original_digest
     checkpoint = nil
-    run_migrations = SqliteDoctorCapture.method(:run_migrations)
-    SqliteDoctorCapture.define_singleton_method(:run_migrations) do |*arguments|
+    run_migrations = SqliteDoctor::Capture.method(:run_migrations)
+    SqliteDoctor::Capture.define_singleton_method(:run_migrations) do |*arguments|
       checkpoint = holder.execute("PRAGMA wal_checkpoint(FULL)").first
       run_migrations.call(*arguments)
     end
@@ -448,7 +520,7 @@ class CaptureTest < Minitest::Test
     assert_operator checkpointed_frames, :>, 0
     refute_equal before, original_digest
   ensure
-    SqliteDoctorCapture.define_singleton_method(:run_migrations, run_migrations)
+    SqliteDoctor::Capture.define_singleton_method(:run_migrations, run_migrations)
     holder&.close
   end
 
