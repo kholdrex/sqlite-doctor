@@ -1,0 +1,36 @@
+{
+  "name": "sqlite-doctor-drizzle",
+  "version": "0.1.0",
+  "description": "Checks pending Drizzle migrations for SQLite table rebuilds that delete rows, by running them on a copy and scanning the SQL with sqlite-doctor.",
+  "license": "MIT",
+  "author": "Alex Kholodniak",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kholdrex/sqlite-doctor.git",
+    "directory": "contrib/drizzle"
+  },
+  "homepage": "https://github.com/kholdrex/sqlite-doctor#drizzle",
+  "type": "module",
+  "bin": {
+    "sqlite-doctor-drizzle": "bin/sqlite-doctor-drizzle.js"
+  },
+  "exports": "./lib/index.js",
+  "files": [
+    "bin",
+    "lib"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "peerDependencies": {
+    "better-sqlite3": ">=11",
+    "drizzle-orm": ">=0.45.0 <0.46.0"
+  },
+  "devDependencies": {
+    "better-sqlite3": "12.11.1",
+    "drizzle-orm": "0.45.4"
+  }
+}

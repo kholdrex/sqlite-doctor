@@ -59,3 +59,25 @@ jobs:
         run: ruby contrib/rails/test/railtie_test.rb
       - name: gem builds
         run: gem build sqlite_doctor.gemspec
+
+  drizzle:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ["20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build the sqlite-doctor binary
+        run: cargo build
+      - name: adapter tests
+        working-directory: contrib/drizzle
+        run: |
+          npm ci
+          npm test
+      - name: package contents
+        working-directory: contrib/drizzle
+        run: npm pack --dry-run

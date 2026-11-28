@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `sqlite-doctor-drizzle` (npm, in `contrib/drizzle`) checks pending Drizzle
+  migrations: it runs them with the project's drizzle-orm 0.45 better-sqlite3
+  migrator on a copy of the database, or with `--base <git revision>` on a
+  database migrated to the files at that revision, and reports each finding
+  at its migration file and line.
 - The Rails helper is a gem, `sqlite_doctor`, on RubyGems from 0.4.0
   (gemspec at the repository root, code in `contrib/rails/lib`). `bin/rails sqlite_doctor:check` captures
   the pending migrations, scans them with the `sqlite-doctor` binary (0.3.0
