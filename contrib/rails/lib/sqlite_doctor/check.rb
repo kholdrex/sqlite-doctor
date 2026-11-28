@@ -143,7 +143,7 @@ module SqliteDoctor::Check
     end
 
     schema_path = in_repository.call(schema_file)
-    entry = git(top, "ls-tree", "-z", commit, "--", ":(literal)#{schema_path}").split("\0").first
+    entry = git(top, "ls-tree", "-z", commit, "--", schema_path).split("\0").first
     raise Error, "#{schema_path} does not exist at #{base}" unless entry
 
     mode, type, object = entry.split("\t", 2).first.split(" ")
@@ -159,7 +159,7 @@ module SqliteDoctor::Check
       raise Error, "migrations path #{path} is a glob pattern, which BASE does not support" if path.to_s.match?(/[*?\[{]/)
 
       directory = in_repository.call(path)
-      git(top, "ls-tree", "-r", "-z", "--name-only", commit, "--", ":(literal)#{directory}/")
+      git(top, "ls-tree", "-r", "-z", "--name-only", commit, "--", "#{directory}/")
         .split("\0").filter_map do |entry|
           parts = entry.delete_prefix("#{directory}/").split("/")
           next if parts.any? { |part| part.start_with?(".") }
@@ -245,8 +245,12 @@ module SqliteDoctor::Check
     end
   end
 
+  # Paths are passed as literal pathspecs whatever the environment says.
+  GIT_ENV = { "GIT_LITERAL_PATHSPECS" => "1", "GIT_GLOB_PATHSPECS" => nil, "GIT_NOGLOB_PATHSPECS" => nil,
+              "GIT_ICASE_PATHSPECS" => nil }.freeze
+
   def git(directory, *arguments)
-    stdout, stderr, status = Open3.capture3("git", "-C", directory.to_s, *arguments, binmode: true)
+    stdout, stderr, status = Open3.capture3(GIT_ENV, "git", "-C", directory.to_s, *arguments, binmode: true)
     raise Error, "git #{arguments.first} failed: #{stderr.strip}" unless status.success?
 
     stdout.force_encoding(Encoding::UTF_8)

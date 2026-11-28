@@ -155,6 +155,20 @@ class CheckTest < Minitest::Test
     git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "base")
   end
 
+  def test_base_ignores_pathspec_settings_in_the_environment
+    base_repository
+    migration(20260101000002, REBUILD, name: "after_base")
+    saved = ENV.fetch("GIT_LITERAL_PATHSPECS", nil)
+    ENV["GIT_LITERAL_PATHSPECS"] = "1"
+
+    status = check(base: "HEAD", schema_file: File.join(@dir, "db", "schema.rb"))
+
+    assert_equal 1, status, @io.string
+    assert_includes @io.string, "1 pending migration(s):\n  db/migrate/20260101000002_after_base.rb\n"
+  ensure
+    ENV["GIT_LITERAL_PATHSPECS"] = saved
+  end
+
   def test_base_uses_the_ledger_rails_reads
     base_repository
     migration(20260101000002, REBUILD, name: "older_than_schema")

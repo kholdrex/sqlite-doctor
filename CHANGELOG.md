@@ -35,6 +35,13 @@ All notable changes to this project are documented here. The format follows
   to `contrib/rails/lib/sqlite_doctor/capture.rb`, and its module from
   `SqliteDoctorCapture` to `SqliteDoctor::Capture`.
 
+### Fixed
+
+- The `sqlite_doctor` gem 0.4.1 counts rows in the main schema, so a TEMP
+  table a migration creates under the same name no longer hides rows lost on
+  the copy, and `BASE` finds the schema and migration files when
+  `GIT_LITERAL_PATHSPECS` or another pathspec setting is in the environment.
+
 ## [0.3.0] - 2026-11-28
 
 Adds a contract for migration adapters and installable release archives.
