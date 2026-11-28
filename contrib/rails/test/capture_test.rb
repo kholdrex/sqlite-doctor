@@ -195,10 +195,12 @@ class CaptureTest < Minitest::Test
                                     migrations_paths: @migrations, output: target)
       end
     end
-    assert_raises(ArgumentError) do
+    error = assert_raises(ArgumentError) do
       SqliteDoctorCapture.capture(config: { adapter: "sqlite3", database: @database },
-                                  migrations_paths: @migrations, output: @database.upcase)
+                                  migrations_paths: @migrations,
+                                  output: File.join(@dir, File.basename(@database).upcase))
     end
+    assert_match(/refusing to write the capture over/, error.message)
 
     capture
     capture
