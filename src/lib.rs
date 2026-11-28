@@ -125,7 +125,10 @@ pub fn diagnose(report: &ScanReport) -> Vec<Finding> {
                                 "can reset dependent foreign keys to their default",
                         }
                     ),
-                    "Disable foreign-key enforcement before starting the transaction, rebuild the table, and run PRAGMA foreign_key_check before COMMIT; roll back if it reports violations. Restore enforcement after the transaction ends.",
+                    match rebuild.kind {
+                        RebuildKind::RenameAway => "Do not rename the original table away: SQLite points the references of other tables at the new name, and they break when that table is dropped. Disable foreign-key enforcement before starting the transaction, create the replacement under a new name, copy the rows, drop the original, rename the replacement to the original name, and run PRAGMA foreign_key_check before COMMIT; roll back if it reports violations. Restore enforcement after the transaction ends.",
+                        RebuildKind::Rename | RebuildKind::Recreate => "Disable foreign-key enforcement before starting the transaction, rebuild the table, and run PRAGMA foreign_key_check before COMMIT; roll back if it reports violations. Restore enforcement after the transaction ends.",
+                    },
                 )
                 .with_related_line(reference.line),
             );

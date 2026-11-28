@@ -11,6 +11,30 @@ sqlite-doctor migration.sql
 Building needs Rust 1.88 or newer. Exit code `0` means nothing found, `1` means at least one finding, `2` means bad
 arguments or an unreadable file. Add `--format json` for CI, and pass `-` to read from stdin.
 
+## JSON output
+
+```json
+{
+  "version": 1,
+  "source": "migration.sql",
+  "findings": [
+    {
+      "code": "SQLD003",
+      "title": "table rebuild may drop an index or trigger",
+      "line": 4,
+      "related_line": 1,
+      "detail": "...",
+      "remediation": "..."
+    }
+  ]
+}
+```
+
+`source` is the path as given, or `-` for stdin. `line` is the one-based line of the statement the finding is
+about, and `related_line` the line of the reference, index or trigger it concerns, or `null`. `code` and the
+meaning of each field are stable within `version` 1. Later releases may add codes and fields, so ignore the ones
+you don't know. `title`, `detail` and `remediation` are text for people and may be reworded in any release.
+
 ## Why this exists
 
 SQLite can't change most column definitions in place, so ORMs rebuild the table: copy the rows out, drop the
@@ -27,14 +51,18 @@ same when a column is made `NOT NULL`. In both, the migration reports success.
 
 | Code | Meaning |
 |---|---|
-| `SQLD001` | A table is rebuilt while a table created earlier in the input references it with `ON DELETE CASCADE`, `SET NULL` or `SET DEFAULT`. Reported unless the input turns foreign keys off before the drop, or drops that child table first. |
+| `SQLD001` | A table is rebuilt while a table created earlier in the input, or given a column by `ALTER TABLE ... ADD COLUMN`, references it with `ON DELETE CASCADE`, `SET NULL` or `SET DEFAULT`. Reported unless the input turns foreign keys off before the drop, or drops that child table first. |
 | `SQLD002` | `PRAGMA foreign_keys` is changed inside a transaction, where SQLite ignores the change. |
 | `SQLD003` | An index or trigger created on a table before the rebuild is not created again afterwards. |
 
 To rebuild a table safely, follow SQLite's order:
 
 1. `PRAGMA foreign_keys = OFF;` before `BEGIN`
-2. `BEGIN;`, then the rebuild
+2. `BEGIN;`, then the rebuild: create the new table under another name, copy the rows, drop the old table, and
+   rename the new one. Don't rename the old table away first: SQLite points the references of other tables at
+   the renamed table, and they break when it is dropped. Views and triggers on other tables that name the old
+   table make the final rename fail. Save the definitions of those views, of views built on them and of triggers
+   on any of them, drop them first, and create them again in dependency order before `COMMIT`.
 3. `PRAGMA foreign_key_check;` and `ROLLBACK;` if it reports anything
 4. `COMMIT;`
 5. `PRAGMA foreign_keys = ON;` after `COMMIT`
@@ -72,7 +100,16 @@ at the end are listed in the header.
 Before migrating, it refuses to start when:
 
 - another connection pool in the app uses the same database file, by path or by `file:` URI;
-- `OUTPUT` points at the database or one of its `-wal`/`-shm`/`-journal` files.
+- `OUTPUT` names the database or any other database file the app configures or has a pool on (compared without
+  case), or ends in `-wal`, `-shm` or `-journal`.
+
+It writes `OUTPUT` only if nothing is there or it is a regular file holding an earlier capture. Anything else,
+including an empty file, a symbolic link and a database a migration created at that path, is refused at the write.
+
+Only the primary database is copied. A migration that writes through another pool, such as a queue or cache
+database, changes that database for real, and so do other side effects such as HTTP calls or file writes. Run
+those migrations against a disposable configuration. A new capture file is readable only by you; a replaced one
+keeps its group and permissions, or becomes readable only by you if its group can't be kept. The capture can contain literal data from data migrations.
 
 A migration that opens its own connection to the original database is not redirected, and it can change that
 database. The task notices afterwards (`PRAGMA data_version`) and fails without writing a capture. A concurrent
@@ -100,7 +137,7 @@ Across Five ORMs". The paper used two builds, kept here as tags:
 | [`study-original`](https://github.com/kholdrex/sqlite-doctor/tree/study-original) | `a65e428` | The linter in the experiments. It knows the create, copy, drop, rename rebuild and `ON DELETE CASCADE`. |
 | [`study-relint`](https://github.com/kholdrex/sqlite-doctor/tree/study-relint) | `2bf86dc` | A later build run on the same inputs. It adds the Rails rebuild and `SET NULL` and `SET DEFAULT` children. |
 
-The [replication package](https://github.com/kholdrex/sqlite-migration-preservation#linter-builds) has the build
+The [replication package](https://github.com/kholdrex/sqlite-migration-preservation/tree/v1.0.0#linter) has the build
 commands, the hashes of both binaries, the inputs and the results. The READMEs at the two tags are historical: they
 describe an early prototype, and the one at `study-relint` compares the tool with Atlas on inputs the paper does
 not use. For usage read this README on `main`; for results read the package.
@@ -127,7 +164,7 @@ builds.
   not parse other SQL dialects.
 - Include the starting schema. Tables, indexes and triggers from earlier migrations or the live database are
   invisible otherwise; the Rails task includes them for you.
-- A reference counts from its `CREATE TABLE` until the input drops that child table or the column that declares
+- A reference counts from its `CREATE TABLE` or `ALTER TABLE ... ADD COLUMN` until the input drops that child table or the column that declares
   it, and follows both tables through `ALTER TABLE ... RENAME TO`. Rebuilding the child without the foreign key
   clears it the same way. A child created in a transaction that rolls back does not count; a drop that a
   `ROLLBACK` undoes before the parent rebuild does not clear it. When it can't tell whether a drop removed the
@@ -151,6 +188,16 @@ builds.
   a plain-column index on it counts as removed, so its loss is not reported. `CREATE TABLE ... AS SELECT` lists
   no columns, so an index is reported even when the query leaves its column out. Views are not checked
   because `DROP TABLE` does not drop them.
+- Known gaps in 0.1.0, where a rebuild that loses rows is not reported: an `INSERT INTO new AS alias ...` copy or a
+  copy `FROM (old)` in parentheses; a temp table that takes the name of a main-schema replacement or original
+  during the rebuild; a trigger body that uses `end` as a column name; a referencing column that a rolled-back
+  `DROP COLUMN` or a later rename leaves in place; a rename while `legacy_alter_table` is on but never set
+  in the input, which is assumed off; either table renamed to an intermediate name during the rebuild; and an
+  unqualified `ALTER TABLE ... ADD COLUMN` after `ATTACH` or after a rolled-back `CREATE TEMP TABLE` of that
+  name, which may be read as the wrong table. The Rails capture merges `PRAGMA foreign_keys` and transactions
+  from every connection on the copy, so a migration that uses a second connection can hide a finding. A
+  `CREATE TABLE IF NOT EXISTS` for a table that already exists is still
+  read as declaring its references, which can report a rebuild that loses nothing.
 
 ## Background
 

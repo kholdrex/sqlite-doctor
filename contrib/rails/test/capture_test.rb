@@ -124,6 +124,127 @@ class CaptureTest < Minitest::Test
     assert_equal before, original_digest
   end
 
+  def test_refuses_to_write_the_capture_over_another_configured_database
+    migration("add_column :parents, :extra, :text")
+    queue = File.join(@dir, "queue.sqlite3")
+    SQLite3::Database.new(queue) { |db| db.execute("CREATE TABLE jobs (id INTEGER PRIMARY KEY)") }
+    queue_digest = Digest::SHA256.file(queue).hexdigest
+    previous = ActiveRecord::Base.configurations
+    ActiveRecord::Base.configurations = {
+      "test" => { "primary" => { "adapter" => "sqlite3", "database" => @database },
+                  "queue" => { "adapter" => "sqlite3", "database" => queue } }
+    }
+
+    ["#{queue}-wal", queue].each do |target|
+      error = assert_raises(ArgumentError, target) do
+        SqliteDoctorCapture.capture(config: { adapter: "sqlite3", database: @database },
+                                    migrations_paths: @migrations, output: target)
+      end
+      assert_match(/refusing to write the capture (over|to) .*#{Regexp.escape(File.basename(target))}/,
+                   error.message)
+    end
+
+    ActiveRecord::Base.configurations = previous
+    SecondaryRecord.establish_connection(adapter: "sqlite3", database: queue)
+    error = assert_raises(ArgumentError) do
+      SqliteDoctorCapture.capture(config: { adapter: "sqlite3", database: @database },
+                                  migrations_paths: @migrations, output: queue)
+    end
+    assert_match(/refusing to write/, error.message)
+    assert_equal queue_digest, Digest::SHA256.file(queue).hexdigest
+  ensure
+    ActiveRecord::Base.configurations = previous if previous
+    SecondaryRecord.remove_connection
+  end
+
+  def test_a_trailing_line_comment_does_not_swallow_the_semicolon
+    migration(<<~RUBY)
+      execute "CREATE TABLE staging (id INTEGER PRIMARY KEY) -- staging table"
+      execute "INSERT INTO staging SELECT id FROM parents;  -- copy  "
+    RUBY
+
+    capture
+    sql = File.read(@output)
+
+    assert_includes sql, "CREATE TABLE staging (id INTEGER PRIMARY KEY) -- staging table\n/**/;\n"
+    assert_includes sql, "INSERT INTO staging SELECT id FROM parents;  -- copy\n/**/;\n"
+  end
+
+  def test_replaces_only_an_earlier_capture
+    migration("add_column :parents, :extra, :text")
+    other = File.join(@dir, "other.sqlite3")
+    SQLite3::Database.new(other) { |db| db.execute("CREATE TABLE jobs (id INTEGER PRIMARY KEY)") }
+    linked = File.join(@dir, "linked.sqlite3")
+    File.symlink(other, linked)
+    digest = Digest::SHA256.file(other).hexdigest
+
+    [other, linked].each do |target|
+      error = assert_raises(ArgumentError, target) do
+        SqliteDoctorCapture.capture(config: { adapter: "sqlite3", database: @database },
+                                    migrations_paths: @migrations, output: target)
+      end
+      assert_match(target == linked ? /symbolic link/ : /not an earlier capture/, error.message)
+    end
+    assert_equal digest, Digest::SHA256.file(other).hexdigest
+    assert File.symlink?(linked)
+
+    [File.join(@dir, "empty.sql"), File.join(@dir, "dangling.sql")].each_with_index do |target, index|
+      index.zero? ? File.write(target, "") : File.symlink(File.join(@dir, "missing"), target)
+      assert_raises(ArgumentError, target) do
+        SqliteDoctorCapture.capture(config: { adapter: "sqlite3", database: @database },
+                                    migrations_paths: @migrations, output: target)
+      end
+    end
+    error = assert_raises(ArgumentError) do
+      SqliteDoctorCapture.capture(config: { adapter: "sqlite3", database: @database },
+                                  migrations_paths: @migrations,
+                                  output: File.join(@dir, File.basename(@database).upcase))
+    end
+    assert_match(/refusing to write the capture over/, error.message)
+
+    capture
+    capture
+    assert File.read(@output).start_with?(SqliteDoctorCapture::CAPTURE_HEADER)
+  end
+
+  def test_refuses_a_database_a_migration_creates_at_the_output
+    migration(<<~RUBY)
+      SQLite3::Database.new(#{@output.inspect}) { |db| db.execute("CREATE TABLE jobs (id INTEGER)") }
+    RUBY
+
+    error = assert_raises(ArgumentError) { capture }
+    assert_match(/not an earlier capture/, error.message)
+    names = nil
+    SQLite3::Database.new(@output) { |db| names = db.execute("SELECT name FROM sqlite_schema") }
+    assert_equal [["jobs"]], names
+  end
+
+  def test_comments_cannot_join_statements
+    migration(<<~RUBY)
+      execute "-- failed: an earlier attempt\nCREATE TABLE staging (id INTEGER PRIMARY KEY) -- staging"
+      execute "CREATE TABLE notes (id INTEGER PRIMARY KEY) /* notes"
+      execute 'CREATE TABLE "stage/*" (id INTEGER PRIMARY KEY)'
+    RUBY
+
+    capture
+    sql = File.read(@output)
+
+    assert_includes sql, "CREATE TABLE staging (id INTEGER PRIMARY KEY) -- staging\n/**/;\n"
+    assert_includes sql, "CREATE TABLE notes (id INTEGER PRIMARY KEY) /* notes\n/**/;\n"
+    assert_includes sql, "CREATE TABLE \"stage/*\" (id INTEGER PRIMARY KEY)\n/**/;\n"
+  end
+
+  def test_a_capture_is_private_and_a_replaced_one_keeps_its_mode
+    migration("add_column :parents, :extra, :text")
+
+    capture
+    assert_equal 0o600, File.stat(@output).mode & 0o777
+
+    File.chmod(0o640, @output)
+    capture
+    assert_equal 0o640, File.stat(@output).mode & 0o777
+  end
+
   def test_refuses_when_another_pool_uses_the_original
     migration("add_column :parents, :extra, :text")
 

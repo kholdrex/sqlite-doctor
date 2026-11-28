@@ -233,3 +233,69 @@ fn in_transaction_pragma_reports_sqld002() {
             .contains("PRAGMA foreign_key_check before COMMIT")
     );
 }
+
+#[test]
+fn rename_away_remediation_keeps_the_original_name_until_the_drop() {
+    let sql = r#"
+PRAGMA foreign_keys = ON;
+CREATE TABLE p (id INTEGER PRIMARY KEY);
+CREATE TABLE c (pid INTEGER REFERENCES p(id) ON DELETE CASCADE);
+BEGIN;
+ALTER TABLE p RENAME TO old_p;
+CREATE TABLE p (id INTEGER PRIMARY KEY);
+INSERT INTO p SELECT id FROM old_p;
+DROP TABLE old_p;
+COMMIT;
+"#;
+    let findings = diagnose(&scan_sql(sql));
+    let cascade = findings
+        .iter()
+        .find(|finding| finding.hazard == HazardId::DeleteActionOnRebuild)
+        .expect("rename-away rebuild should be diagnosed");
+    let remediation = &cascade.remediation;
+    assert!(remediation.starts_with("Do not rename the original table away"));
+    let drop = remediation
+        .find("drop the original")
+        .expect("the original is dropped");
+    let rename = remediation
+        .find("rename the replacement to the original name")
+        .expect("the replacement takes the name after the drop");
+    assert!(drop < rename);
+}
+
+#[test]
+fn the_last_on_delete_clause_decides_the_action() {
+    let rebuild = r#"
+CREATE TABLE __new_p (id INTEGER PRIMARY KEY);
+INSERT INTO __new_p SELECT id FROM p;
+DROP TABLE p;
+ALTER TABLE __new_p RENAME TO p;
+"#;
+    let delete_actions = |child: &str| {
+        diagnose(&scan_sql(&format!(
+            "PRAGMA foreign_keys = ON;\n{child}\n{rebuild}"
+        )))
+        .into_iter()
+        .filter(|finding| finding.hazard == HazardId::DeleteActionOnRebuild)
+        .count()
+    };
+
+    assert_eq!(
+        delete_actions(
+            "CREATE TABLE c (id INTEGER);\nALTER TABLE c ADD COLUMN pid REFERENCES p(id) ON DELETE CASCADE ON DELETE NO ACTION;"
+        ),
+        0
+    );
+    assert_eq!(
+        delete_actions(
+            "CREATE TABLE c (pid REFERENCES p(id) ON DELETE CASCADE ON DELETE RESTRICT);"
+        ),
+        0
+    );
+    assert_eq!(
+        delete_actions(
+            "CREATE TABLE c (pid REFERENCES p(id) ON DELETE RESTRICT ON DELETE SET NULL);"
+        ),
+        1
+    );
+}

@@ -235,3 +235,35 @@ fn a_renamed_temp_table_still_shadows_main() {
 
     assert_eq!(codes(sql), vec![("SQLD001", 10), ("SQLD003", 10)]);
 }
+
+#[test]
+fn the_capture_terminator_ends_statements_in_every_comment_state() {
+    let rebuild = |create: &str, rename: &str| {
+        format!(
+            "PRAGMA foreign_keys = 1;
+CREATE TABLE p (id INTEGER PRIMARY KEY);
+CREATE TABLE c (pid INTEGER REFERENCES p(id) ON DELETE CASCADE);
+{create}
+/**/;
+INSERT INTO \"stage/*\" SELECT id FROM p;
+DROP TABLE p;
+{rename}
+/**/;
+"
+        )
+    };
+
+    for (create, rename) in [
+        (
+            "CREATE TABLE \"stage/*\" (id INTEGER PRIMARY KEY) -- staging table",
+            "ALTER TABLE \"stage/*\" RENAME TO p",
+        ),
+        (
+            "CREATE TABLE \"stage/*\" (id INTEGER PRIMARY KEY) /* staging",
+            "-- db/migrate/*.sql\nALTER TABLE \"stage/*\" RENAME TO p /*/",
+        ),
+    ] {
+        let sql = rebuild(create, rename);
+        assert_eq!(codes(&sql), vec![("SQLD001", 7)], "{sql}");
+    }
+}
