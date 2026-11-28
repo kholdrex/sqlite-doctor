@@ -342,11 +342,12 @@ module SqliteDoctor::Capture
 
   def row_counts(connection)
     tables = connection.select_values(<<~SQL)
-      SELECT name FROM sqlite_schema
+      SELECT name FROM main.sqlite_schema
       WHERE type = 'table' AND name NOT GLOB 'sqlite_*'
     SQL
+    # Qualified, so a TEMP table of the same name is not counted instead.
     tables.to_h do |table|
-      [table, connection.select_value("SELECT count(*) FROM #{connection.quote_table_name(table)}")]
+      [table, connection.select_value("SELECT count(*) FROM main.#{connection.quote_table_name(table)}")]
     end
   end
 

@@ -85,6 +85,17 @@ class CaptureTest < Minitest::Test
     assert_equal ["children 2 -> 0"], result[:shrunk_tables]
   end
 
+  def test_rows_are_counted_in_the_main_schema_not_a_temp_table_of_the_same_name
+    migration(<<~RUBY)
+      add_foreign_key :parents, :tenants, column: :tenant_id
+      execute "CREATE TEMP TABLE children AS SELECT 1 AS id UNION ALL SELECT 2 UNION ALL SELECT 3"
+    RUBY
+
+    result = capture
+
+    assert_equal ["children 2 -> 0"], result[:shrunk_tables]
+  end
+
   def test_keeps_tables_whose_names_only_start_with_sqlite
     SQLite3::Database.new(@database) do |db|
       db.execute_batch(<<~SQL)
