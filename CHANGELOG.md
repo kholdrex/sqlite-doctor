@@ -37,6 +37,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- The `sqlite_doctor` gem 0.4.2 names the capture file next to each finding
+  only when `OUTPUT` keeps it, as `sqlite-doctor-drizzle` 0.1.1 does.
 - `sqlite-doctor-drizzle` 0.1.1 names the capture file next to each finding
   only when `--output` keeps it; it used to name the temporary file the check
   had already removed.

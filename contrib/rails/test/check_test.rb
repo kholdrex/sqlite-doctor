@@ -73,7 +73,16 @@ class CheckTest < Minitest::Test
 
     assert_equal 1, check
     assert_includes @io.string, "1 pending migration(s):\n  db/migrate/20260101000001_change20260101000001.rb"
-    assert_match(%r{SQLD001: .*\n  --> db/migrate/20260101000001_change20260101000001\.rb \(}, @io.string)
+    assert_match(%r{SQLD001: .*\n  --> db/migrate/20260101000001_change20260101000001\.rb\n}, @io.string)
+    refute_includes @io.string, "capture.sql"
+  end
+
+  def test_a_kept_capture_is_named_beside_each_finding
+    migration(20260101000001, REBUILD)
+    kept = File.join(@dir, "kept.sql")
+
+    assert_equal 1, check(output: kept)
+    assert_match(%r{SQLD001: .*\n  --> db/migrate/20260101000001_change20260101000001\.rb \(#{Regexp.escape(kept)}:\d+\)\n}, @io.string)
   end
 
   def test_no_pending_migrations_is_a_clean_complete_check
