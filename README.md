@@ -146,10 +146,10 @@ ALTER TABLE __new_users RENAME TO users;
 A migration file doesn't show the SQL that matters: ActiveRecord opens the transaction, sets `foreign_keys = OFF`
 inside it (which does nothing), and rebuilds the table through a holding copy.
 
-Add the gem (from GitHub until it is on RubyGems) and run the check:
+Add the gem and run the check:
 
 ```ruby
-gem "sqlite_doctor", github: "kholdrex/sqlite-doctor", group: [:development, :test]
+gem "sqlite_doctor", group: [:development, :test]
 ```
 
 ```bash
