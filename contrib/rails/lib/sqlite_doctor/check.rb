@@ -35,10 +35,11 @@ module SqliteDoctor::Check
                 "from the SQL alone: a migration whose SQL depends on rows, or a trigger or view the schema file " \
                 "leaves out, is not covered."
       end
+      kept = output
       output ||= File.join(dir, "capture.sql")
       result = SqliteDoctor::Capture.capture(config: config, migrations_paths: migrations_paths, output: output,
                                              root: root, name: name, env_name: env_name, watch: watch)
-      report(binary, result, io)
+      report(binary, result, io, kept)
     end
   rescue StandardError, ScriptError => e
     known = e.is_a?(Error) || e.is_a?(SqliteDoctor::Capture::Refused)
@@ -57,7 +58,9 @@ module SqliteDoctor::Check
                           "the kholdrex/sqlite-doctor GitHub Action or a release archive, or set SQLITE_DOCTOR")
   end
 
-  def report(binary, result, io)
+  # `kept` is the capture the user asked to keep, if any; without one the
+  # scanned file is removed when the check ends, so it is not named.
+  def report(binary, result, io, kept = nil)
     stdout, stderr, status = Open3.capture3(binary, "--format", "json", result[:output])
     report = begin
       JSON.parse(stdout)
@@ -81,7 +84,7 @@ module SqliteDoctor::Check
     report["findings"].each do |finding|
       io.puts
       io.puts "#{finding['code']}: #{finding['title']}"
-      io.puts "  --> #{location(finding['location'])} (#{report['source']}:#{finding['line']})"
+      io.puts "  --> #{location(finding['location'])}#{" (#{kept}:#{finding['line']})" if kept}"
       io.puts "  #{finding['detail']}"
       io.puts "  help: #{finding['remediation']}"
     end
