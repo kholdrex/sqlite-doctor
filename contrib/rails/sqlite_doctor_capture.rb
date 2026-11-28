@@ -20,6 +20,7 @@ require "tmpdir"
 
 module SqliteDoctorCapture
   SIDE_FILES = ["", "-wal", "-shm", "-journal"].freeze
+  CAPTURE_HEADER = "-- sqlite-doctor capture:".freeze
 
   module_function
 
@@ -90,12 +91,8 @@ module SqliteDoctorCapture
 
       # A failed statement did not change the schema, so it must not count as
       # restoring an object. Keep it visible as a comment.
-      if payload[:exception]
-        failures << payload[:sql]
-        statements << "-- failed: #{payload[:sql].gsub(/\s+/, ' ')}"
-      else
-        statements << payload[:sql]
-      end
+      failures << payload[:sql] if payload[:exception]
+      statements << [payload[:sql], !payload[:exception].nil?]
     end
     begin
       ActiveRecord::MigrationContext.new(Array(migrations_paths)).migrate
@@ -144,15 +141,40 @@ module SqliteDoctorCapture
     main && !main[2].to_s.empty? ? File.realpath(main[2]) : nil
   end
 
+  # Names are compared without case, which some file systems ignore.
   def reject_output_aliasing(database, output)
-    SIDE_FILES.each do |suffix|
-      protected_path = database + suffix
-      next unless output == protected_path ||
-                  (File.exist?(output) && File.exist?(protected_path) &&
-                   File.identical?(output, protected_path))
-
-      raise ArgumentError, "refusing to write the capture over #{protected_path}"
+    if output.match?(/-(wal|shm|journal)\z/i)
+      raise ArgumentError, "refusing to write the capture to #{output}: " \
+                           "SQLite uses names ending in -wal, -shm and -journal"
     end
+
+    protected_databases(database).each do |path|
+      next unless output.casecmp?(path) ||
+                  (File.exist?(output) && File.exist?(path) && File.identical?(output, path))
+
+      raise ArgumentError, "refusing to write the capture over #{path}"
+    end
+  end
+
+  # The database being migrated and every file the app configures a database
+  # at or has a connection pool on, including pools that are not connected
+  # yet. Adapter names are not checked: an alias can still open SQLite. A
+  # `file:` setting counts both as a URI and as a plain file name, because
+  # older sqlite3 gems open it as a plain name.
+  def protected_databases(database)
+    configs = ActiveRecord::Base.configurations.configs_for(include_hidden: true)
+    pools = ActiveRecord::Base.connection_handler.connection_pool_list(:all).map(&:db_config)
+    paths = (configs + pools).flat_map do |db_config|
+      setting = db_config.database.to_s
+      names = [pool_database_path(db_config)]
+      names << resolve_database_path(setting) if setting.start_with?("file:")
+      names.compact.flat_map do |path|
+        directory = File.dirname(path)
+        path = File.join(File.realpath(directory), File.basename(path)) if File.directory?(directory)
+        File.exist?(path) ? [path, File.realpath(path)] : [path]
+      end
+    end
+    [database, *paths].uniq
   end
 
   def reject_other_pools(database)
@@ -206,7 +228,7 @@ module SqliteDoctorCapture
 
   def render(schema, foreign_keys, statements, failures, shrunk, error)
     lines = []
-    lines << "-- sqlite-doctor capture: ActiveRecord #{ActiveRecord::VERSION::STRING}, " \
+    lines << "#{CAPTURE_HEADER} ActiveRecord #{ActiveRecord::VERSION::STRING}, " \
              "SQLite #{SQLite3::SQLITE_VERSION}"
     lines << "-- Migration target: temporary database copy."
     lines << "-- Migration failed: #{error.class}: #{error.message.lines.first&.strip}" if error
@@ -220,23 +242,56 @@ module SqliteDoctorCapture
     lines << "PRAGMA foreign_keys = #{foreign_keys};"
     lines << ""
     lines << "-- Executed statements"
-    statements.each { |sql| lines << (sql.start_with?("-- failed: ") ? sql : terminate(sql)) }
+    statements.each do |sql, failed|
+      lines << (failed ? "-- failed: #{sql.gsub(/\s+/, ' ')}" : terminate(sql))
+    end
     lines.join("\n") + "\n"
   end
 
+  # SQLite ends a comment at the end of each statement it is given, but here
+  # the statements are joined. After a newline, `/**/` closes a block comment
+  # left open and is an empty comment otherwise, so the semicolon always ends
+  # the statement.
   def terminate(sql)
-    sql.sub(/;?\s*\z/, ";")
+    sql = sql.sub(/;?\s*\z/, "")
+    sql.include?("--") || sql.include?("/*") ? "#{sql}\n/**/;" : "#{sql};"
   end
 
-  # Tempfile creates the staging file with O_EXCL, so a file or symlink
-  # already at that name is never followed or truncated, and removes it if
-  # the write or the rename fails.
+  # Tempfile creates the staging file with O_EXCL and mode 0600, so a file or
+  # symlink already at that name is never followed or truncated, and removes
+  # it afterwards. A new capture is published with a hard link, which fails if
+  # anything appeared at OUTPUT meanwhile. Only a regular file holding an
+  # earlier capture is replaced, so a database a migration created there or
+  # one opened under another name is refused. A replaced capture keeps its
+  # group and mode when the group can be kept; the SQL can hold literal data
+  # from data migrations.
   def write_atomically(output, content)
     Tempfile.create([File.basename(output), ".tmp"], File.dirname(output)) do |staging|
       staging.write(content)
       staging.close
-      File.chmod(0o644 & ~File.umask, staging.path)
-      File.rename(staging.path, output)
+      if File.symlink?(output)
+        raise ArgumentError, "refusing to write the capture over #{output}: it is a symbolic link"
+      elsif File.exist?(output)
+        unless File.file?(output) &&
+               File.open(output, "rb") { |file| file.read(CAPTURE_HEADER.bytesize) } == CAPTURE_HEADER
+          raise ArgumentError, "refusing to write the capture over #{output}: it is not an earlier capture"
+        end
+
+        stat = File.stat(output)
+        begin
+          File.chown(nil, stat.gid, staging.path)
+          File.chmod(stat.mode & 0o777, staging.path)
+        rescue Errno::EPERM
+          nil
+        end
+        File.rename(staging.path, output)
+      else
+        begin
+          File.link(staging.path, output)
+        rescue Errno::EEXIST
+          raise ArgumentError, "refusing to write the capture over #{output}: it appeared while migrating"
+        end
+      end
     end
   end
 end

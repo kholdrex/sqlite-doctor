@@ -158,7 +158,8 @@ pub struct DeleteActionReference {
     /// One-based source line containing the reference.
     pub line: usize,
     pub(crate) statement_index: usize,
-    /// Schema and table from the CREATE TABLE that declared the reference.
+    /// Schema and table from the CREATE TABLE or ALTER TABLE ... ADD COLUMN
+    /// that declared the reference.
     pub(crate) dependent_identity: (String, String),
     pub(crate) referenced_table_parts: Vec<String>,
     /// The column that declares the reference inline. `DROP COLUMN` takes
@@ -329,7 +330,7 @@ pub fn scan_sql(sql: &str) -> ScanReport {
                 report.dropped_schema_objects.len() - 1,
             ));
         }
-        for reference in delete_action_references(statement, statement_index) {
+        for reference in delete_action_references(statement, statement_index, &temps) {
             report.delete_action_references.push(reference);
             journal.record(Undoable::Reference(
                 report.delete_action_references.len() - 1,
@@ -1366,8 +1367,19 @@ fn dropped_schema_object(statement: &Statement) -> Option<(SchemaObjectKind, Nam
 fn delete_action_references(
     statement: &Statement,
     statement_index: usize,
+    temps: &TempTables,
 ) -> Vec<DeleteActionReference> {
     let tokens = &statement.tokens;
+    if let Some((dependent_table, start)) = added_column(statement) {
+        let identity = owned(temps.resolve(&dependent_table));
+        return column_references(
+            tokens,
+            (start, tokens.len()),
+            &dependent_table,
+            identity,
+            statement_index,
+        );
+    }
     let Some((dependent_table, opening_parenthesis)) = created_table(statement) else {
         return Vec::new();
     };
@@ -1375,66 +1387,102 @@ fn delete_action_references(
         return Vec::new();
     }
 
-    let mut references = Vec::new();
-    for (start, end) in table_definition_ranges(tokens, opening_parenthesis) {
-        // A column can carry several REFERENCES clauses; the actions of each
-        // run up to the next one.
-        let clauses: Vec<_> = (start..end)
-            .filter(|index| token_is(tokens, *index, "REFERENCES"))
-            .collect();
-        for (position, &reference_index) in clauses.iter().enumerate() {
-            let end = clauses.get(position + 1).copied().unwrap_or(end);
-            let Some((referenced_table, mut index)) = parse_name(tokens, reference_index + 1)
-            else {
-                continue;
-            };
-            if symbol_is(tokens, index, '(') {
-                let Some(after_columns) = after_balanced_parentheses(tokens, index) else {
-                    continue;
-                };
-                index = after_columns;
-            }
-            let Some(action) = delete_action(tokens, index, end) else {
-                continue;
-            };
-            if dependent_table.matches(&referenced_table) {
-                continue;
-            }
-            references.push(DeleteActionReference {
-                dependent_table: dependent_table.canonical(),
-                referenced_table: referenced_table.canonical(),
-                action,
-                line: tokens[reference_index].line,
+    table_definition_ranges(tokens, opening_parenthesis)
+        .into_iter()
+        .flat_map(|range| {
+            column_references(
+                tokens,
+                range,
+                &dependent_table,
+                created_identity(statement, &dependent_table),
                 statement_index,
-                dependent_identity: created_identity(statement, &dependent_table),
-                referenced_table_parts: referenced_table.parts,
-                column: (!["CONSTRAINT", "FOREIGN"]
-                    .iter()
-                    .any(|keyword| token_is(tokens, start, keyword)))
-                .then(|| identifier(&tokens[start]))
-                .flatten(),
-                undone_at: None,
-            });
+            )
+        })
+        .collect()
+}
+
+/// The table and the start of the column definition of `ALTER TABLE ... ADD
+/// [COLUMN] ...`.
+fn added_column(statement: &Statement) -> Option<(Name, usize)> {
+    let tokens = &statement.tokens;
+    if !token_is(tokens, 0, "ALTER") || !token_is(tokens, 1, "TABLE") {
+        return None;
+    }
+    let (table, index) = parse_name(tokens, 2)?;
+    if !token_is(tokens, index, "ADD") {
+        return None;
+    }
+    Some((
+        table,
+        index + 1 + usize::from(token_is(tokens, index + 1, "COLUMN")),
+    ))
+}
+
+/// The `ON DELETE` references in one column definition or table constraint.
+fn column_references(
+    tokens: &[Token],
+    (start, end): (usize, usize),
+    dependent_table: &Name,
+    dependent_identity: (String, String),
+    statement_index: usize,
+) -> Vec<DeleteActionReference> {
+    let mut references = Vec::new();
+    // A column can carry several REFERENCES clauses; the actions of each run
+    // up to the next one.
+    let clauses: Vec<_> = (start..end)
+        .filter(|index| token_is(tokens, *index, "REFERENCES"))
+        .collect();
+    for (position, &reference_index) in clauses.iter().enumerate() {
+        let end = clauses.get(position + 1).copied().unwrap_or(end);
+        let Some((referenced_table, mut index)) = parse_name(tokens, reference_index + 1) else {
+            continue;
+        };
+        if symbol_is(tokens, index, '(') {
+            let Some(after_columns) = after_balanced_parentheses(tokens, index) else {
+                continue;
+            };
+            index = after_columns;
         }
+        let Some(action) = delete_action(tokens, index, end) else {
+            continue;
+        };
+        if dependent_table.matches(&referenced_table) {
+            continue;
+        }
+        references.push(DeleteActionReference {
+            dependent_table: dependent_table.canonical(),
+            referenced_table: referenced_table.canonical(),
+            action,
+            line: tokens[reference_index].line,
+            statement_index,
+            dependent_identity: dependent_identity.clone(),
+            referenced_table_parts: referenced_table.parts,
+            column: (!["CONSTRAINT", "FOREIGN"]
+                .iter()
+                .any(|keyword| token_is(tokens, start, keyword)))
+            .then(|| identifier(&tokens[start]))
+            .flatten(),
+            undone_at: None,
+        });
     }
     references
 }
 
+/// The action of the last `ON DELETE` clause, which is the one SQLite keeps.
 fn delete_action(tokens: &[Token], start: usize, end: usize) -> Option<DeleteAction> {
-    (start..end).find_map(|index| {
-        if !token_is(tokens, index, "ON") || !token_is(tokens, index + 1, "DELETE") {
-            return None;
-        }
-        if token_is(tokens, index + 2, "CASCADE") {
-            Some(DeleteAction::Cascade)
-        } else if token_is(tokens, index + 2, "SET") && token_is(tokens, index + 3, "NULL") {
-            Some(DeleteAction::SetNull)
-        } else if token_is(tokens, index + 2, "SET") && token_is(tokens, index + 3, "DEFAULT") {
-            Some(DeleteAction::SetDefault)
-        } else {
-            None
-        }
-    })
+    (start..end)
+        .rfind(|index| token_is(tokens, *index, "ON") && token_is(tokens, index + 1, "DELETE"))
+        .and_then(|index| {
+            if token_is(tokens, index + 2, "CASCADE") {
+                Some(DeleteAction::Cascade)
+            } else if token_is(tokens, index + 2, "SET") && token_is(tokens, index + 3, "NULL") {
+                Some(DeleteAction::SetNull)
+            } else if token_is(tokens, index + 2, "SET") && token_is(tokens, index + 3, "DEFAULT") {
+                Some(DeleteAction::SetDefault)
+            } else {
+                None
+            }
+        })
 }
 
 fn table_definition_ranges(tokens: &[Token], opening_parenthesis: usize) -> Vec<(usize, usize)> {
