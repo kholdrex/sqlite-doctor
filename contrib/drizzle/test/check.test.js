@@ -15,13 +15,14 @@ const fixtures = path.join(here, "fixtures", "drizzle");
 const binary = process.env.SQLITE_DOCTOR ?? path.resolve(here, "../../../target/debug/sqlite-doctor");
 const journal = JSON.parse(fs.readFileSync(path.join(fixtures, "meta", "_journal.json"), "utf8"));
 const directories = [];
+const runner = loadRunner(path.resolve(here, ".."));
 
 before(() => assert.ok(fs.existsSync(binary), `build sqlite-doctor or set SQLITE_DOCTOR (${binary})`));
 after(() => directories.forEach((dir) => fs.rmSync(dir, { recursive: true, force: true })));
 
-function project(count, root = fs.mkdtempSync(path.join(os.tmpdir(), "drizzle-test-"))) {
+function project(count, root = fs.mkdtempSync(path.join(os.tmpdir(), "drizzle-test-")), name = "drizzle") {
   directories.push(root);
-  const folder = path.join(root, "drizzle");
+  const folder = path.join(root, name);
   fs.mkdirSync(path.join(folder, "meta"), { recursive: true });
   const entries = journal.entries.slice(0, count);
   for (const entry of entries) fs.copyFileSync(path.join(fixtures, `${entry.tag}.sql`), path.join(folder, `${entry.tag}.sql`));
@@ -29,12 +30,13 @@ function project(count, root = fs.mkdtempSync(path.join(os.tmpdir(), "drizzle-te
   return root;
 }
 
-function addMigration(root, tag, sql, when) {
-  const file = path.join(root, "drizzle", "meta", "_journal.json");
+function addMigration(root, tag, sql, when, name = "drizzle") {
+  const file = path.join(root, name, "meta", "_journal.json");
   const current = JSON.parse(fs.readFileSync(file, "utf8"));
   current.entries.push({ idx: current.entries.length, version: "6", when, tag, breakpoints: true });
   fs.writeFileSync(file, JSON.stringify(current));
-  fs.writeFileSync(path.join(root, "drizzle", `${tag}.sql`), sql);
+  fs.mkdirSync(path.dirname(path.join(root, name, `${tag}.sql`)), { recursive: true });
+  fs.writeFileSync(path.join(root, name, `${tag}.sql`), sql);
 }
 
 // A database migrated to the first file, with a parent and its child.
@@ -47,7 +49,7 @@ function seededDatabase(root) {
 
 async function run(options) {
   const lines = [];
-  const status = await check({ binary, ...options }, (line) => lines.push(line));
+  const status = await check({ binary, runner, ...options }, (line) => lines.push(line));
   return { status, output: lines.join("\n") };
 }
 
@@ -171,10 +173,10 @@ test("the capture is not written over a file that is not a capture", async () =>
 test("an installed @libsql/client needs the driver confirmed", async () => {
   const root = project(2);
   seededDatabase(root);
-  const runner = { ...loadRunner(root), libsql: true };
+  const libsql = { ...runner, libsql: true };
 
-  await assert.rejects(run({ root, database: "app.db", runner }), /--driver better-sqlite3/);
-  const { status } = await run({ root, database: "app.db", runner, driver: "better-sqlite3" });
+  await assert.rejects(run({ root, database: "app.db", runner: libsql }), /--driver better-sqlite3/);
+  const { status } = await run({ root, database: "app.db", runner: libsql, driver: "better-sqlite3" });
   assert.equal(status, 0);
 });
 
@@ -196,6 +198,7 @@ test("the command exits with the check's status", () => {
   seededDatabase(root);
   addMigration(root, journal.entries[1].tag, fs.readFileSync(path.join(fixtures, `${journal.entries[1].tag}.sql`), "utf8"),
     journal.entries[1].when);
+  fs.symlinkSync(path.resolve(here, "../node_modules"), path.join(root, "node_modules"));
   const command = path.resolve(here, "../bin/sqlite-doctor-drizzle.js");
   const env = { ...process.env, SQLITE_DOCTOR: binary };
 
@@ -206,4 +209,85 @@ test("the command exits with the check's status", () => {
   assert.match(found.stdout, /SQLD001/);
   assert.equal(usage.status, 2);
   assert.match(usage.stderr, /--foreign-keys must be on or off/);
+});
+
+const rebuild = fs.readFileSync(path.join(fixtures, `${journal.entries[1].tag}.sql`), "utf8");
+const commit = (repository) => {
+  const git = (...args) => execFileSync("git", ["-C", repository, "-c", "user.name=t", "-c", "user.email=t@example.invalid", ...args]);
+  git("init", "-q");
+  git("add", ".");
+  git("commit", "-q", "-m", "base");
+};
+
+test("a migration that mentions ATTACH is not run", async () => {
+  const root = project(2);
+  seededDatabase(root);
+  addMigration(root, "0002_attach", "ATTACH DATABASE 'other.db' AS other;", 1795893540000);
+
+  await assert.rejects(run({ root, database: "app.db" }), /0002_attach\.sql mentions ATTACH or VACUUM/);
+  assert.equal(fs.existsSync(path.join(root, "other.db")), false);
+});
+
+test("transaction statements in a migration file keep their file lines", async () => {
+  const root = project(2);
+  seededDatabase(root);
+  addMigration(root, "0002_own_transaction",
+    "COMMIT;--> statement-breakpoint\nPRAGMA foreign_keys=OFF;--> statement-breakpoint\nBEGIN;", 1795893540000);
+
+  const { status, output } = await run({ root, database: "app.db", output: "capture.sql" });
+
+  assert.equal(status, 0, output);
+  const capture = fs.readFileSync(path.join(root, "capture.sql"), "utf8");
+  assert.match(capture, /-- sqlite-doctor:file 1 drizzle\/0002_own_transaction\.sql\nCOMMIT;/);
+  assert.match(capture, /-- sqlite-doctor:file 3 drizzle\/0002_own_transaction\.sql\nBEGIN;/);
+});
+
+test("a table name with a line break stays inside the capture comment", async () => {
+  const root = project(2);
+  const db = new Database(path.join(root, "app.db"));
+  migrate(drizzle(db), { migrationsFolder: path.join(root, "drizzle") });
+  db.exec('CREATE TABLE "kids\narchive" (id integer, parent_id integer REFERENCES parents(id) ON DELETE CASCADE);' +
+    "INSERT INTO parents VALUES (1, 'a'); INSERT INTO \"kids\narchive\" VALUES (1, 1);");
+  db.close();
+  addMigration(root, "0002_drop_name", rebuild.replaceAll("`name` text NOT NULL", "`label` text").replace(
+    'INSERT INTO `__new_parents`("id", "name") SELECT "id", "name" FROM `parents`;', 'INSERT INTO `__new_parents`("id") SELECT "id" FROM `parents`;'),
+  1795893540000);
+
+  const { status, output } = await run({ root, database: "app.db" });
+
+  assert.equal(status, 1, output);
+  assert.match(output, /SQLD001: .*\n {2}--> drizzle\/0002_drop_name\.sql:8 /);
+  assert.match(output, /Dependent table `kids\narchive`/);
+});
+
+test("base reads nested migration files from a folder whose name has a tab", async () => {
+  const repository = fs.mkdtempSync(path.join(os.tmpdir(), "drizzle-repo-"));
+  directories.push(repository);
+  const name = "db\tmigrations";
+  project(0, repository, name);
+  addMigration(repository, "nested/0000_init", fs.readFileSync(path.join(fixtures, "0000_init.sql"), "utf8"),
+    journal.entries[0].when, name);
+  commit(repository);
+  addMigration(repository, journal.entries[1].tag, rebuild, journal.entries[1].when, name);
+
+  const { status, output } = await run({ root: repository, base: "HEAD", migrations: name });
+
+  assert.equal(status, 1, output);
+  assert.match(output, /1 pending migration\(s\):\n {2}db\tmigrations\/0001_name_required\.sql\n/);
+  assert.match(output, /SQLD001/);
+});
+
+test("base applies --foreign-keys off while it replays the old migrations", async () => {
+  const repository = fs.mkdtempSync(path.join(os.tmpdir(), "drizzle-repo-"));
+  directories.push(repository);
+  project(1, repository);
+  addMigration(repository, "0001_seed", "INSERT INTO `children` VALUES (1, 1);--> statement-breakpoint\nINSERT INTO `parents` VALUES (1, 'a');",
+    1795893539000);
+  commit(repository);
+
+  const off = await run({ root: repository, base: "HEAD", foreignKeys: false });
+  await assert.rejects(run({ root: repository, base: "HEAD" }), /FOREIGN KEY|SqliteError|DrizzleError|Failed to run/);
+
+  assert.equal(off.status, 0, off.output);
+  assert.match(off.output, /No pending migrations\./);
 });

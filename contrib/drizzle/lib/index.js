@@ -3,7 +3,7 @@
 // to the migration files at that git revision, records every statement the
 // connection executes and scans that SQL with the sqlite-doctor binary.
 
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
@@ -14,21 +14,21 @@ export const CAPTURE_HEADER = "-- sqlite-doctor capture:";
 export const SUPPORTED = /^0\.45\./;
 const RESERVED_LINE = /^[ \t\f\r\ufeff]*-- sqlite-doctor:/m;
 const BREAKPOINT = "--> statement-breakpoint";
+const OUTSIDE_WRITE = /\b(ATTACH|VACUUM)\b/i;
+const MAX_BUFFER = 1024 ** 3;
 
 export class CheckError extends Error {}
 
-// drizzle-orm and better-sqlite3 from the project, or else from this package.
+// drizzle-orm and better-sqlite3 as the project at `root` resolves them.
 export function loadRunner(root) {
-  const requires = [createRequire(path.join(root, "package.json")), createRequire(import.meta.url)];
+  const require = createRequire(path.join(root, "package.json"));
   const load = (name) => {
-    for (const require of requires) {
-      try {
-        return { module: require(name), file: require.resolve(name) };
-      } catch (error) {
-        if (error.code !== "MODULE_NOT_FOUND") throw error;
-      }
+    try {
+      return { module: require(name), file: require.resolve(name) };
+    } catch (error) {
+      if (error.code === "MODULE_NOT_FOUND") throw new CheckError(`${name} is not installed in ${root}`);
+      throw error;
     }
-    throw new CheckError(`${name} is not installed in ${root}`);
   };
   const orm = load("drizzle-orm/better-sqlite3");
   const migrator = load("drizzle-orm/better-sqlite3/migrator");
@@ -46,12 +46,20 @@ export function loadRunner(root) {
   if (!SUPPORTED.test(ormVersion)) {
     throw new CheckError(`drizzle-orm ${ormVersion} is not supported; this adapter models the 0.45 migrator`);
   }
-  let libsql = true;
-  try {
-    requires[0].resolve("@libsql/client");
-  } catch {
-    libsql = false;
-  }
+  // drizzle-kit migrate uses @libsql/client when it can import it, from the
+  // project or from drizzle-kit's own dependencies.
+  const resolvers = [require];
+  const kit = (require.resolve.paths("drizzle-kit") ?? []).map((dir) => path.join(dir, "drizzle-kit", "package.json"))
+    .find((manifest) => fs.existsSync(manifest));
+  if (kit) resolvers.push(createRequire(kit));
+  const libsql = resolvers.some((resolver) => {
+    try {
+      resolver.resolve("@libsql/client");
+      return true;
+    } catch {
+      return false;
+    }
+  });
   return {
     Database: Database.module,
     drizzle: orm.module.drizzle,
@@ -85,18 +93,28 @@ export function quoteIdentifier(name) {
   return `"${name.replaceAll('"', '""')}"`;
 }
 
+// ATTACH and VACUUM INTO write to files other than the copy, so a migration
+// that may use them is not run.
+function refuseOutsideWrites(migrations, relative) {
+  const found = migrations.find((migration) => OUTSIDE_WRITE.test(migration.text));
+  if (found) {
+    throw new CheckError(`${relative(found.file)} mentions ATTACH or VACUUM, which can write outside the temporary ` +
+      "database, so the check does not run it");
+  }
+}
+
 // The migrations the 0.45 migrator runs: every journal entry newer than the
 // newest one recorded in the ledger.
 function pendingMigrations(db, migrations, table) {
-  const exists = db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(table);
+  const exists = db.prepare("SELECT 1 FROM main.sqlite_schema WHERE type = 'table' AND name = ? COLLATE NOCASE").get(table);
   if (!exists) return migrations;
-  const last = db.prepare(`SELECT created_at FROM ${quoteIdentifier(table)} ORDER BY created_at DESC LIMIT 1`).raw().get();
+  const last = db.prepare(`SELECT created_at FROM main.${quoteIdentifier(table)} ORDER BY created_at DESC LIMIT 1`).raw().get();
   return last ? migrations.filter((migration) => Number(last[0]) < migration.when) : migrations;
 }
 
 function rowCounts(db) {
-  const tables = db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB 'sqlite_*'").pluck().all();
-  return new Map(tables.map((table) => [table, db.prepare(`SELECT count(*) FROM ${quoteIdentifier(table)}`).pluck().get()]));
+  const tables = db.prepare("SELECT name FROM main.sqlite_schema WHERE type = 'table' AND name NOT GLOB 'sqlite_*'").pluck().all();
+  return new Map(tables.map((table) => [table, db.prepare(`SELECT count(*) FROM main.${quoteIdentifier(table)}`).pluck().get()]));
 }
 
 export function terminate(sql) {
@@ -121,25 +139,43 @@ export function capture({ runner, database, folder, table = "__drizzle_migration
   const trace = [];
   let recording = false;
   const db = new runner.Database(database, { fileMustExist: true, verbose: (sql) => recording && trace.push({ sql }) });
-  // better-sqlite3 logs a statement when it runs, so one that fails to
-  // prepare is recorded here.
+  // better-sqlite3 logs a statement when it starts running. One that fails
+  // to prepare or to bind is never logged, and one that fails while running
+  // is the one logged during that call.
   const prepare = db.prepare.bind(db);
   db.prepare = (source) => {
+    let statement;
     try {
-      return prepare(source);
+      statement = prepare(source);
     } catch (error) {
       if (recording) trace.push({ sql: source, failed: true });
       throw error;
     }
+    const run = statement.run.bind(statement);
+    statement.run = (...args) => {
+      const logged = trace.length;
+      try {
+        return run(...args);
+      } catch (error) {
+        if (recording) {
+          if (trace.length > logged) trace[trace.length - 1].failed = true;
+          else trace.push({ sql: source, failed: true });
+        }
+        throw error;
+      }
+    };
+    return statement;
   };
   try {
     if (foreignKeys !== undefined) db.pragma(`foreign_keys = ${foreignKeys ? "ON" : "OFF"}`);
     const schema = db
-      .prepare("SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT GLOB 'sqlite_*' ORDER BY rowid")
+      .prepare("SELECT sql FROM main.sqlite_schema WHERE sql IS NOT NULL AND name NOT GLOB 'sqlite_*' ORDER BY rowid")
       .pluck()
       .all();
     const fkState = db.pragma("foreign_keys", { simple: true });
     const pending = pendingMigrations(db, migrations, table);
+    const relative = (file) => path.relative(root, file) || file;
+    refuseOutsideWrites(pending, relative);
     const before = rowCounts(db);
     let error = null;
     recording = true;
@@ -147,12 +183,6 @@ export function capture({ runner, database, folder, table = "__drizzle_migration
       runner.migrate(runner.drizzle(db), { migrationsFolder: folder, migrationsTable: table });
     } catch (caught) {
       error = caught;
-      // A statement that prepared and then failed is the last one logged
-      // before the migrator's ROLLBACK.
-      if (!trace.some((entry) => entry.failed)) {
-        const last = trace.length - (/^\s*ROLLBACK\s*$/i.test(trace.at(-1)?.sql ?? "") ? 2 : 1);
-        if (last >= 0) trace[last].failed = true;
-      }
     } finally {
       recording = false;
     }
@@ -160,11 +190,10 @@ export function capture({ runner, database, folder, table = "__drizzle_migration
     const attached = db.pragma("database_list").filter((entry) => !["main", "temp"].includes(entry.name));
     const shrunk = [...before].filter(([name, count]) => after.has(name) && after.get(name) < count)
       .map(([name, count]) => `${name}: ${count} -> ${after.get(name)}`);
-    const relative = (file) => path.relative(root, file) || file;
     const { statements, incomplete } = attribute(trace, pending, table, error, relative);
     if (error) incomplete.push(`the migration raised ${singleLine(error.name || error.constructor.name)}`);
     if (attached.length) incomplete.push("a migration attached another database");
-    if (statements.some((statement) => RESERVED_LINE.test(statement.sql))) {
+    if ([...schema, ...statements.map((statement) => statement.sql)].some((sql) => RESERVED_LINE.test(sql))) {
       incomplete.push("copied SQL has a line that starts with `-- sqlite-doctor:`");
     }
     return {
@@ -183,65 +212,56 @@ export function capture({ runner, database, folder, table = "__drizzle_migration
 }
 
 // Labels each traced statement with the file and line it came from. The
-// migrator runs the chunks of each pending file in order and then records
-// the file in the ledger, all between one BEGIN and one COMMIT.
+// migrator runs every chunk of each pending file in order and then records
+// the file in the ledger, all between its BEGIN and COMMIT. Anything else
+// makes the check incomplete.
 function attribute(trace, pending, table, error, relative) {
-  const ledgerInsert = `INSERT INTO ${quoteIdentifier(table)} ("hash", "created_at") VALUES(`;
+  const ledgerInsert = `INSERT INTO ${quoteIdentifier(table)} ("hash", "created_at") VALUES('`;
   const statements = [];
-  const incomplete = [];
-  let group = [];
+  const incomplete = new Set();
   let index = 0;
+  let position = 0;
   let inTransaction = false;
-  const synthetic = ({ sql, failed }) => statements.push({ sql, label: { synthetic: "Drizzle migrator" }, failed });
-  const flush = () => {
-    if (!group.length) return;
+  for (const { sql, failed } of trace) {
     const migration = pending[index];
-    const chunks = migration?.chunks ?? [];
-    const exact = group.length <= chunks.length && group.every(({ sql }, k) => sql.length && chunks[k].text.startsWith(sql));
-    group.forEach(({ sql, failed }, k) => {
-      let label;
-      if (exact) {
-        const lead = sql.match(/^\s*/)[0].length;
-        label = { file: relative(migration.file), line: lineAt(migration.text, chunks[k].offset + lead) };
-        sql = sql.slice(lead);
-      } else {
-        label = migration ? { migration: relative(migration.file) } : { synthetic: "unknown migration" };
-      }
-      statements.push({ sql, label, failed });
-    });
-    group = [];
-  };
-  for (const entry of trace) {
-    const { sql } = entry;
+    const chunk = migration?.chunks[position];
     if (!inTransaction) {
-      synthetic(entry);
+      statements.push({ sql, label: { synthetic: "Drizzle migrator" }, failed });
       inTransaction = /^\s*BEGIN\s*$/i.test(sql);
-      continue;
-    }
-    if (sql.startsWith(ledgerInsert)) {
-      const when = Number(sql.match(/, ([^,()]+)\)$/)?.[1]);
-      if (pending[index]?.when !== when) incomplete.push("the migrator ran migrations in an unexpected order");
-      flush();
-      synthetic(entry);
+    } else if (chunk && sql.length && chunk.text.startsWith(sql)) {
+      const lead = sql.match(/^\s*/)[0].length;
+      const line = lineAt(migration.text, chunk.offset + lead);
+      statements.push({ sql: sql.slice(lead), label: { file: relative(migration.file), line }, failed });
+      position += 1;
+    } else if (migration && sql.startsWith(ledgerInsert)) {
+      const [, hash, when] = sql.slice(ledgerInsert.length - 1).match(/^'([0-9a-f]*)'(?:\/\*[^*]*\*\/)?, ([^,()]+)\)$/) ?? [];
+      const digest = crypto.createHash("sha256").update(migration.text).digest("hex");
+      if (position !== migration.chunks.length || Number(when) !== migration.when || !hash || !digest.startsWith(hash)) {
+        incomplete.add(`the statements recorded for ${relative(migration.file)} do not match the file`);
+      }
+      statements.push({ sql, label: { synthetic: "Drizzle migrator" }, failed });
       index += 1;
-    } else if (/^\s*(COMMIT|ROLLBACK)\s*$/i.test(sql)) {
-      flush();
-      synthetic(entry);
+      position = 0;
+    } else if (!migration && /^\s*COMMIT\s*$/i.test(sql)) {
+      statements.push({ sql, label: { synthetic: "Drizzle migrator" }, failed });
+      inTransaction = false;
+    } else if (error && /^\s*ROLLBACK\s*$/i.test(sql)) {
+      statements.push({ sql, label: { synthetic: "Drizzle migrator" }, failed });
       inTransaction = false;
     } else {
-      group.push(entry);
+      statements.push({ sql, label: migration ? { migration: relative(migration.file) } : { synthetic: "unknown" }, failed });
+      incomplete.add("the migrator ran a statement that is not in the migration files");
     }
   }
-  flush();
-  if (!error && index !== pending.length) incomplete.push("the migrator ran a different number of migrations than expected");
-  return { statements, incomplete };
+  if (!error && index !== pending.length) incomplete.add("the migrator ran a different number of migrations than expected");
+  return { statements, incomplete: [...incomplete] };
 }
 
 export function render(result) {
   const lines = [result.header, "-- Migration target: temporary database."];
   if (result.error) lines.push(`-- Migration failed: ${singleLine(`${result.error.name}: ${result.error.message}`)}`);
   for (const reason of result.incomplete) lines.push(`-- sqlite-doctor:incomplete ${singleLine(reason)}`);
-  for (const line of result.shrunk) lines.push(`-- Observed on the copy: rows in ${line}`);
+  for (const line of result.shrunk) lines.push(`-- Observed on the copy: rows in ${singleLine(line)}`);
   lines.push("", "-- Baseline schema", "-- sqlite-doctor:migration schema before migrating");
   for (const sql of result.schema) lines.push(terminate(sql));
   lines.push("", "-- Connection state before migrating", "-- sqlite-doctor:synthetic connection state before migrating");
@@ -270,17 +290,42 @@ export function writeCapture(output, content) {
   }
   const staging = path.join(path.dirname(output), `.${path.basename(output)}.${crypto.randomUUID()}.tmp`);
   fs.writeFileSync(staging, content, { flag: "wx", mode: 0o600 });
-  fs.renameSync(staging, output);
+  try {
+    if (stat) {
+      fs.renameSync(staging, output);
+    } else {
+      // A link fails if anything appeared at the name in the meantime.
+      try {
+        fs.linkSync(staging, output);
+      } catch (error) {
+        if (error.code === "EEXIST") throw new CheckError(`refusing to write the capture over ${output}: it appeared while writing`);
+        throw error;
+      }
+    }
+  } finally {
+    fs.rmSync(staging, { force: true });
+  }
 }
 
 function git(directory, ...args) {
-  const result = spawnSync("git", ["-C", directory, ...args], { encoding: "buffer" });
+  const result = spawnSync("git", ["-C", directory, ...args], { encoding: "buffer", maxBuffer: MAX_BUFFER });
+  if (result.error) throw new CheckError(`git ${args[0]} failed: ${result.error.message}`);
   if (result.status !== 0) throw new CheckError(`git ${args[0]} failed: ${result.stderr.toString().trim()}`);
   return result.stdout;
 }
 
-// The migrations folder as it is at `base`, written under `dir`, or null if
-// the folder does not exist there.
+// The tree entry at `name` in `commit`, or null.
+function treeEntry(top, commit, name) {
+  const listing = git(top, "ls-tree", "-z", "--full-tree", commit, "--", `:(literal)${name}`).toString("utf8");
+  const entry = listing.split("\0").find(Boolean);
+  if (!entry) return null;
+  const tab = entry.indexOf("\t");
+  const [mode, type, object] = entry.slice(0, tab).split(" ");
+  return entry.slice(tab + 1) === name ? { mode, type, object } : null;
+}
+
+// The migrations folder as it is at `base`, the journal and the files it
+// names written under `dir`, or null if the folder has no journal there.
 export function folderAt(base, folder, dir) {
   if (!base || base.startsWith("-") || /[\u0000-\u001f\u007f]/.test(base)) throw new CheckError("BASE must name a git revision");
   const absolute = path.resolve(folder);
@@ -288,21 +333,35 @@ export function folderAt(base, folder, dir) {
   const relative = path.relative(fs.realpathSync(top), fs.realpathSync(absolute)).split(path.sep).join("/");
   if (relative === ".." || relative.startsWith("../")) throw new CheckError(`${folder} is outside the git repository`);
   const commit = git(top, "rev-parse", "--verify", "--end-of-options", `${base}^{commit}`).toString().trim();
-  const prefix = relative ? `${relative}/` : "";
-  const listing = git(top, "ls-tree", "-r", "-z", "--full-tree", commit, "--", `:(literal)${prefix}`).toString("utf8");
-  const target = path.join(dir, "base-migrations");
-  let found = false;
-  for (const entry of listing.split("\0").filter(Boolean)) {
-    const [meta, name] = entry.split("\t");
-    const [mode, type, object] = meta.split(" ");
-    const inside = name.slice(prefix.length);
-    if (type !== "blob" || mode === "120000" || !(inside === "meta/_journal.json" || /^[^/]+\.sql$/.test(inside))) continue;
-    found = true;
-    const file = path.join(target, ...inside.split("/"));
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, git(top, "cat-file", "blob", object));
+  const blob = (name) => {
+    const entry = treeEntry(top, commit, name);
+    if (!entry) return null;
+    if (entry.mode === "120000") throw new CheckError(`${name} is a symbolic link at ${base}, which the check does not follow`);
+    if (entry.type !== "blob") throw new CheckError(`${name} is not a file at ${base}`);
+    return git(top, "cat-file", "blob", entry.object);
+  };
+  if (relative) {
+    const entry = treeEntry(top, commit, relative);
+    if (!entry) return null;
+    if (entry.mode === "120000") throw new CheckError(`${relative} is a symbolic link at ${base}, which the check does not follow`);
+    if (entry.type !== "tree") throw new CheckError(`${relative} is not a directory at ${base}`);
   }
-  return found ? target : null;
+  const prefix = relative ? `${relative}/` : "";
+  const journal = blob(`${prefix}meta/_journal.json`);
+  if (!journal) return null;
+  const target = path.join(dir, "base-migrations");
+  fs.mkdirSync(path.join(target, "meta"), { recursive: true });
+  fs.writeFileSync(path.join(target, "meta", "_journal.json"), journal);
+  for (const { tag } of JSON.parse(journal.toString("utf8")).entries) {
+    const name = path.posix.normalize(`${tag}.sql`);
+    if (name.startsWith("../") || path.posix.isAbsolute(name)) throw new CheckError(`the journal at ${base} names ${tag}, outside the folder`);
+    const content = blob(`${prefix}${name}`);
+    if (!content) throw new CheckError(`${prefix}${name} is listed in the journal at ${base} but does not exist`);
+    const file = path.join(target, ...name.split("/"));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, content);
+  }
+  return target;
 }
 
 export function findBinary(binary = process.env.SQLITE_DOCTOR) {
@@ -314,7 +373,7 @@ export function findBinary(binary = process.env.SQLITE_DOCTOR) {
     }
   };
   if (binary) {
-    if (executable(binary)) return binary;
+    if (executable(binary)) return path.resolve(binary);
     throw new CheckError(`SQLITE_DOCTOR=${binary} is not an executable file`);
   }
   const found = (process.env.PATH ?? "").split(path.delimiter).map((dir) => path.join(dir, "sqlite-doctor")).find(executable);
@@ -326,7 +385,8 @@ export function findBinary(binary = process.env.SQLITE_DOCTOR) {
 }
 
 export function report(binary, result, output, print) {
-  const run = spawnSync(binary, ["--format", "json", output], { encoding: "utf8" });
+  const run = spawnSync(binary, ["--format", "json", output], { encoding: "utf8", maxBuffer: MAX_BUFFER });
+  if (run.error) throw new CheckError(`${binary} could not be run: ${run.error.message}`);
   let parsed = null;
   try {
     parsed = JSON.parse(run.stdout);
@@ -348,7 +408,7 @@ export function report(binary, result, output, print) {
     print(`Migration failed on the copy: ${result.error.name}. Its message can quote SQL with data, so it is only in ` +
       "the capture: rerun with --output <file> to keep it.");
   }
-  if (run.status === null || run.status > 1 || !parsed.complete) return 2;
+  if (run.status === null || run.status > 1 || !parsed.complete || result.error || result.incomplete.length) return 2;
   return run.status;
 }
 
@@ -370,7 +430,11 @@ export async function check(options, print = console.log) {
       const baseFolder = folderAt(options.base, folder, dir);
       const db = new runner.Database(database);
       try {
-        if (baseFolder) runner.migrate(runner.drizzle(db), { migrationsFolder: baseFolder, migrationsTable: options.table });
+        if (options.foreignKeys !== undefined) db.pragma(`foreign_keys = ${options.foreignKeys ? "ON" : "OFF"}`);
+        if (baseFolder) {
+          refuseOutsideWrites(readMigrations(baseFolder), (file) => `${path.relative(baseFolder, file)} at ${options.base}`);
+          runner.migrate(runner.drizzle(db), { migrationsFolder: baseFolder, migrationsTable: options.table });
+        }
       } finally {
         db.close();
       }
@@ -396,9 +460,12 @@ export async function check(options, print = console.log) {
       foreignKeys: options.foreignKeys,
       root,
     });
-    const output = options.output ? path.resolve(root, options.output) : path.join(dir, "capture.sql");
-    writeCapture(output, render(result));
-    return report(binary, result, output, print);
+    // The binary scans this run's own file; --output gets a copy.
+    const content = render(result);
+    const scanned = path.join(dir, "capture.sql");
+    fs.writeFileSync(scanned, content, { flag: "wx", mode: 0o600 });
+    if (options.output) writeCapture(path.resolve(root, options.output), content);
+    return report(binary, result, scanned, print);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
