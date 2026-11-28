@@ -17,10 +17,13 @@ COMMIT;
 "#;
 
     let report = scan_sql(sql);
-    assert_eq!(report.delete_action_references.len(), 1);
-    assert_eq!(report.delete_action_references[0].dependent_table, "orders");
+    assert_eq!(report.delete_action_references().len(), 1);
     assert_eq!(
-        report.delete_action_references[0].referenced_table,
+        report.delete_action_references()[0].dependent_table,
+        "orders"
+    );
+    assert_eq!(
+        report.delete_action_references()[0].referenced_table,
         "accounts"
     );
 
@@ -137,7 +140,10 @@ PRAGMA foreign_keys=ON;
 "#;
 
     let report = scan_sql(sql);
-    assert_eq!(report.rebuilds[0].foreign_keys_enabled_at_drop, Some(false));
+    assert_eq!(
+        report.rebuilds()[0].foreign_keys_enabled_at_drop,
+        Some(false)
+    );
     assert!(diagnose(&report).is_empty());
 }
 
@@ -205,7 +211,10 @@ ALTER TABLE __new_accounts RENAME TO accounts;
 COMMIT;
 "#;
     let report = scan_sql(sql);
-    assert_eq!(report.rebuilds[0].foreign_keys_enabled_at_drop, Some(true));
+    assert_eq!(
+        report.rebuilds()[0].foreign_keys_enabled_at_drop,
+        Some(true)
+    );
     assert!(
         diagnose(&report)
             .iter()

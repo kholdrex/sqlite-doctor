@@ -10,7 +10,7 @@ fn rebuild(body_before: &str, body_after_drop: &str) -> String {
 /// test for their absence fails when the rebuild is no longer recognized.
 fn missing_after_one_rebuild(sql: &str) -> (ScanReport, Vec<Finding>) {
     let report = scan_sql(sql);
-    assert_eq!(report.rebuilds.len(), 1, "{sql}");
+    assert_eq!(report.rebuilds().len(), 1, "{sql}");
     let missing = diagnose(&report)
         .into_iter()
         .filter(|finding| finding.hazard == HazardId::MissingSchemaObjectRestoration)
@@ -26,9 +26,9 @@ fn reports_each_explicit_index_and_trigger_not_restored_after_rebuild() {
     );
 
     let report = scan_sql(&sql);
-    assert_eq!(report.schema_objects.len(), 2);
-    assert_eq!(report.schema_objects[0].kind, SchemaObjectKind::Index);
-    assert_eq!(report.schema_objects[1].kind, SchemaObjectKind::Trigger);
+    assert_eq!(report.schema_objects().len(), 2);
+    assert_eq!(report.schema_objects()[0].kind, SchemaObjectKind::Index);
+    assert_eq!(report.schema_objects()[1].kind, SchemaObjectKind::Trigger);
 
     let findings: Vec<_> = diagnose(&report)
         .into_iter()
@@ -50,7 +50,7 @@ fn recreation_on_replacement_table_between_drop_and_rename_is_restored() {
     );
 
     let (report, missing) = missing_after_one_rebuild(&sql);
-    assert_eq!(report.schema_objects.len(), 4);
+    assert_eq!(report.schema_objects().len(), 4);
     assert!(missing.is_empty());
 }
 
@@ -62,8 +62,8 @@ fn explicit_object_removal_before_table_drop_is_intentional() {
     );
 
     let (report, missing) = missing_after_one_rebuild(&sql);
-    assert_eq!(report.schema_objects.len(), 2);
-    assert_eq!(report.dropped_schema_objects.len(), 2);
+    assert_eq!(report.schema_objects().len(), 2);
+    assert_eq!(report.dropped_schema_objects().len(), 2);
     assert!(missing.is_empty());
 }
 
@@ -116,7 +116,7 @@ fn an_object_drop_that_survives_the_transaction_is_a_removal() {
             "",
         );
         let (report, missing) = missing_after_one_rebuild(&sql);
-        assert_eq!(report.dropped_schema_objects.len(), 1, "{name}");
+        assert_eq!(report.dropped_schema_objects().len(), 1, "{name}");
         assert!(missing.is_empty(), "{name}");
     }
 }
@@ -128,7 +128,7 @@ fn quoted_names_match_recreation_but_different_names_do_not() {
         "CREATE INDEX `idx_email` ON `__new_users`(email);",
     );
     let (report, missing) = missing_after_one_rebuild(&restored);
-    assert_eq!(report.schema_objects.len(), 2);
+    assert_eq!(report.schema_objects().len(), 2);
     assert!(missing.is_empty());
 
     let renamed = rebuild(
@@ -160,7 +160,7 @@ CREATE VIEW active_users AS SELECT * FROM users;
 "#;
 
     let (report, missing) = missing_after_one_rebuild(sql);
-    assert_eq!(report.schema_objects.len(), 3);
+    assert_eq!(report.schema_objects().len(), 3);
     assert!(missing.is_empty());
 }
 
@@ -175,9 +175,9 @@ END;
 "#;
 
     let report = scan_sql(sql);
-    assert_eq!(report.schema_objects.len(), 1);
-    assert_eq!(report.schema_objects[0].kind, SchemaObjectKind::Trigger);
-    assert!(report.rebuilds.is_empty());
+    assert_eq!(report.schema_objects().len(), 1);
+    assert_eq!(report.schema_objects()[0].kind, SchemaObjectKind::Trigger);
+    assert!(report.rebuilds().is_empty());
 }
 
 #[test]
@@ -306,7 +306,7 @@ fn qualified_object_names_match_only_compatible_qualification() {
         "CREATE INDEX idx_users_email ON __new_users(email);",
     );
     let (report, missing) = missing_after_one_rebuild(&restored);
-    assert_eq!(report.schema_objects.len(), 2);
+    assert_eq!(report.schema_objects().len(), 2);
     assert!(missing.is_empty());
 
     let wrong_schema = rebuild(
@@ -348,7 +348,7 @@ DROP TABLE likes;
 ALTER TABLE __new_likes RENAME TO likes;
 "#;
     let (report, missing) = missing_after_one_rebuild(rename);
-    assert_eq!(report.schema_objects.len(), 1);
+    assert_eq!(report.schema_objects().len(), 1);
     assert!(missing.is_empty());
 }
 

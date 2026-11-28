@@ -1,3 +1,34 @@
+//! Checks SQLite migration SQL for table rebuilds that can delete or change
+//! dependent rows, or drop indexes and triggers.
+//!
+//! [`check_sql`] is the entry point. [`scan_sql`] returns what the scanner
+//! recognised, for callers that want to inspect it, and [`diagnose`] turns
+//! that into findings.
+//!
+//! ```
+//! use sqlite_doctor::{HazardId, check_sql};
+//!
+//! let sql = "\
+//! PRAGMA foreign_keys = ON;
+//! CREATE TABLE parents(id INTEGER PRIMARY KEY);
+//! CREATE TABLE children(parent_id INTEGER REFERENCES parents(id) ON DELETE CASCADE);
+//! BEGIN;
+//! CREATE TABLE __new_parents(id INTEGER PRIMARY KEY, name TEXT);
+//! INSERT INTO __new_parents(id) SELECT id FROM parents;
+//! DROP TABLE parents;
+//! ALTER TABLE __new_parents RENAME TO parents;
+//! COMMIT;";
+//!
+//! let findings = check_sql(sql);
+//! assert_eq!(findings[0].hazard, HazardId::DeleteActionOnRebuild);
+//! assert_eq!(findings[0].line, 7);
+//! ```
+//!
+//! Later versions may add hazards, enum variants without fields, and struct
+//! fields, so matches on the enums need a wildcard arm. Identify a hazard by
+//! [`HazardId::code`], not by casting it to an integer. Hazard codes stay
+//! fixed; the `detail` and `remediation` texts may be reworded.
+
 use std::fmt;
 
 mod scanner;
@@ -10,6 +41,7 @@ pub use scanner::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HazardId {
     DeleteActionOnRebuild,
     ForeignKeysPragmaInsideTransaction,
@@ -17,7 +49,7 @@ pub enum HazardId {
 }
 
 impl HazardId {
-    pub const ALL: [Self; 3] = [
+    pub const ALL: &'static [Self] = &[
         Self::DeleteActionOnRebuild,
         Self::ForeignKeysPragmaInsideTransaction,
         Self::MissingSchemaObjectRestoration,
@@ -51,6 +83,7 @@ impl fmt::Display for HazardId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Finding {
     pub hazard: HazardId,
     pub line: usize,
@@ -60,7 +93,7 @@ pub struct Finding {
 }
 
 impl Finding {
-    pub fn new(
+    pub(crate) fn new(
         hazard: HazardId,
         line: usize,
         detail: impl Into<String>,
@@ -75,10 +108,16 @@ impl Finding {
         }
     }
 
-    pub fn with_related_line(mut self, line: usize) -> Self {
+    pub(crate) fn with_related_line(mut self, line: usize) -> Self {
         self.related_line = Some(line);
         self
     }
+}
+
+/// Scans `sql` and returns its findings sorted by line. The order of findings
+/// on the same line is unspecified.
+pub fn check_sql(sql: &str) -> Vec<Finding> {
+    diagnose(&scan_sql(sql))
 }
 
 /// `SQLD001` requires a complete rebuild and a matching `ON DELETE CASCADE`,
@@ -649,7 +688,10 @@ mod tests {
     #[test]
     fn hazard_codes_are_stable() {
         assert_eq!(
-            HazardId::ALL.map(HazardId::code),
+            HazardId::ALL
+                .iter()
+                .map(|hazard| hazard.code())
+                .collect::<Vec<_>>(),
             ["SQLD001", "SQLD002", "SQLD003"]
         );
     }

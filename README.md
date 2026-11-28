@@ -4,12 +4,14 @@ Checks SQLite migration SQL for table rebuilds that can delete or change depende
 triggers.
 
 ```bash
-cargo install --path .        # from a clone; not on crates.io yet
+cargo install sqlite-doctor
 sqlite-doctor migration.sql
 ```
 
 Building needs Rust 1.88 or newer. Exit code `0` means nothing found, `1` means at least one finding, `2` means bad
 arguments or an unreadable file. Add `--format json` for CI, and pass `-` to read from stdin.
+
+From Rust, `sqlite_doctor::check_sql` returns the same findings; see the [API docs](https://docs.rs/sqlite-doctor).
 
 ## JSON output
 
@@ -188,7 +190,7 @@ builds.
   a plain-column index on it counts as removed, so its loss is not reported. `CREATE TABLE ... AS SELECT` lists
   no columns, so an index is reported even when the query leaves its column out. Views are not checked
   because `DROP TABLE` does not drop them.
-- Known gaps in 0.1.0, where a rebuild that loses rows is not reported: an `INSERT INTO new AS alias ...` copy or a
+- Known gaps, where a rebuild that loses rows is not reported: an `INSERT INTO new AS alias ...` copy or a
   copy `FROM (old)` in parentheses; a temp table that takes the name of a main-schema replacement or original
   during the rebuild; a trigger body that uses `end` as a column name; a referencing column that a rolled-back
   `DROP COLUMN` or a later rename leaves in place; a rename while `legacy_alter_table` is on but never set
